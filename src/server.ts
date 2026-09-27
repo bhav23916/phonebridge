@@ -140,7 +140,8 @@ const httpServer = http.createServer((req, res) => {
 });
 
 const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-const ws = new WebSocket(protocol + window.location.host);;
+const ws = new WebSocket(protocol + window.location.host);
+
 
 const connectedDevices = new Map<string, WebSocket>();
 const deviceRegistry = new Map<string, DeviceInfo>();
