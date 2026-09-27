@@ -3,6 +3,15 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
+interface DeviceLocation {
+    latitude: number;
+    longitude: number;
+    accuracy?: number;
+    altitude?: number;
+    speed?: number;
+    timestamp?: number;
+}
+
 interface DeviceInfo {
     manufacturer: string;
     model: string;
@@ -10,6 +19,7 @@ interface DeviceInfo {
     sdkInt: number;
     batteryLevel?: number;
     isCharging?: boolean;
+    location?: DeviceLocation;
 }
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
@@ -23,14 +33,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155; padding-bottom: 16px; margin-bottom: 24px; }
     h1 { margin: 0; font-size: 22px; font-weight: 700; color: #38bdf8; }
     .status-badge { background: #1e293b; padding: 6px 12px; border-radius: 9999px; font-size: 13px; border: 1px solid #475569; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; }
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     .card h2 { margin: 0 0 8px 0; font-size: 18px; color: #f1f5f9; }
     .device-meta { font-size: 13px; color: #94a3b8; margin-bottom: 16px; line-height: 1.5; }
     .meta-tag { font-family: monospace; font-size: 11px; background: #0f172a; padding: 2px 6px; border-radius: 4px; }
+    .loc-box { background: #090d16; border: 1px solid #1e293b; border-radius: 6px; padding: 10px; margin-top: 10px; font-size: 12px; font-family: monospace; color: #38bdf8; }
+    .loc-box a { color: #f59e0b; text-decoration: underline; margin-top: 4px; display: inline-block; font-weight: bold; }
     .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
     button { background: #2563eb; color: white; border: none; padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; cursor: pointer; transition: background 0.15s; }
     button:hover { background: #1d4ed8; }
+    button.locate { background: #059669; }
+    button.locate:hover { background: #047857; }
     button.torch-off { background: #475569; }
     button.torch-off:hover { background: #334155; }
     button.alarm-on { background: #dc2626; }
@@ -113,6 +127,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           ? d.batteryLevel + "%" + (d.isCharging ? " (Charging)" : "") 
           : "Unknown";
 
+        const locHtml = d.location ? \`
+          <div class="loc-box">
+            <div>GPS: \${d.location.latitude.toFixed(6)}, \${d.location.longitude.toFixed(6)}</div>
+            <div>Accuracy: ±\${d.location.accuracy ? d.location.accuracy.toFixed(1) : "?"}m</div>
+            <a href="https://www.google.com/maps?q=\${d.location.latitude},\${d.location.longitude}" target="_blank">Open in Google Maps →</a>
+          </div>
+        \` : '<div class="loc-box" style="color: #64748b;">GPS: Not acquired yet</div>';
+
         return \`
           <div class="card">
             <h2>\${d.manufacturer || "Android"} \${d.model || "Device"}</h2>
@@ -120,8 +142,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               <div>OS: Android \${d.androidVersion || "?"} (SDK \${d.sdkInt || "?"})</div>
               <div>Battery: \${batteryStr}</div>
               <div style="margin-top: 6px;">ID: <span class="meta-tag">\${d.id}</span></div>
+              \${locHtml}
             </div>
             <div class="actions">
+              <button class="locate" onclick="sendCommand('\${d.id}', 'GET_LOCATION')">Locate Device</button>
               <button onclick="sendCommand('\${d.id}', 'PING')">Ping</button>
               <button onclick="sendCommand('\${d.id}', 'VIBRATE')">Vibrate</button>
               <button onclick="sendCommand('\${d.id}', 'GET_BATTERY')">Refresh Battery</button>
@@ -274,6 +298,39 @@ wss.on("connection", (socket: WebSocket) => {
                 deviceRegistry.set(deviceId, current);
 
                 pushDeviceListUpdate();
+                return;
+            }
+
+            if (parsed.type === "LOCATION_DATA" && deviceId) {
+                const current = deviceRegistry.get(deviceId) || {
+                    manufacturer: "Unknown",
+                    model: "Device",
+                    androidVersion: "?",
+                    sdkInt: 0,
+                };
+                current.location = {
+                    latitude: parsed.latitude,
+                    longitude: parsed.longitude,
+                    accuracy: parsed.accuracy,
+                    altitude: parsed.altitude,
+                    speed: parsed.speed,
+                    timestamp: parsed.timestamp,
+                };
+                deviceRegistry.set(deviceId, current);
+
+                pushDeviceListUpdate();
+                broadcastToDashboards({
+                    type: "ACTIVITY",
+                    message: `Location received from ${deviceId.slice(0, 8)}: ${parsed.latitude.toFixed(4)}, ${parsed.longitude.toFixed(4)}`,
+                });
+                return;
+            }
+
+            if (parsed.type === "LOCATION_ERROR" && deviceId) {
+                broadcastToDashboards({
+                    type: "ACTIVITY",
+                    message: `Location failed for ${deviceId.slice(0, 8)}: ${parsed.error}`,
+                });
                 return;
             }
 
