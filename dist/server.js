@@ -27,6 +27,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     button:hover { background: #1d4ed8; }
     button.torch-off { background: #475569; }
     button.torch-off:hover { background: #334155; }
+    button.alarm-on { background: #dc2626; }
+    button.alarm-on:hover { background: #b91c1c; }
+    button.alarm-off { background: #64748b; }
+    button.alarm-off:hover { background: #475569; }
     .log-box { margin-top: 24px; background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 160px; overflow-y: auto; font-family: monospace; font-size: 12px; color: #a5f3fc; }
   </style>
 </head>
@@ -117,6 +121,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               <button onclick="sendCommand('\${d.id}', 'GET_BATTERY')">Refresh Battery</button>
               <button onclick="sendCommand('\${d.id}', 'TORCH_ON')">Torch ON</button>
               <button class="torch-off" onclick="sendCommand('\${d.id}', 'TORCH_OFF')">Torch OFF</button>
+              <button class="alarm-on" onclick="sendCommand('\${d.id}', 'ALARM_START')">Ring Alarm</button>
+              <button class="alarm-off" onclick="sendCommand('\${d.id}', 'ALARM_STOP')">Stop Alarm</button>
             </div>
           </div>
         \`;
@@ -126,6 +132,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 const httpServer = http_1.default.createServer((req, res) => {
+    if (req.url === "/health") {
+        res.writeHead(200, { "Content-Type": "text/plain" });
+        res.end("OK");
+        return;
+    }
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(DASHBOARD_HTML);
 });
