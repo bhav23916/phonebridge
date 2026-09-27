@@ -1,8 +1,7 @@
 import http from "http";
 import { WebSocketServer, WebSocket } from "ws";
-import * as readline from "readline";
 
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
 interface DeviceInfo {
     manufacturer: string;
@@ -13,7 +12,6 @@ interface DeviceInfo {
     isCharging?: boolean;
 }
 
-// Basic HTML dashboard UI served on http://localhost:8080
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -54,7 +52,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </main>
 
   <script>
-    const ws = new WebSocket("ws://" + window.location.host);
+    const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
+    const ws = new WebSocket(protocol + window.location.host);
     const deviceListEl = document.getElementById("deviceList");
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
@@ -133,15 +132,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 </body>
 </html>`;
 
-// Setup HTTP server
 const httpServer = http.createServer((req, res) => {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(DASHBOARD_HTML);
 });
 
-const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-const ws = new WebSocket(protocol + window.location.host);
-
+const wss = new WebSocketServer({ server: httpServer });
 
 const connectedDevices = new Map<string, WebSocket>();
 const deviceRegistry = new Map<string, DeviceInfo>();
@@ -198,7 +194,6 @@ wss.on("connection", (socket: WebSocket) => {
         try {
             const parsed = JSON.parse(data.toString());
 
-            // 1. Dashboard Client Registration
             if (parsed.type === "REGISTER_DASHBOARD") {
                 clientType = "DASHBOARD";
                 dashboardSockets.add(socket);
@@ -207,7 +202,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 2. Command originated from Dashboard UI
             if (parsed.type === "DASHBOARD_COMMAND") {
                 const targetId = parsed.deviceId;
                 const command = parsed.command;
@@ -219,7 +213,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 3. Android Device Registration
             if (parsed.type === "REGISTER_DEVICE") {
                 clientType = "PHONE";
                 deviceId = parsed.deviceId;
@@ -240,7 +233,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 4. Android Device Info
             if (parsed.type === "DEVICE_INFO" && deviceId) {
                 const current = deviceRegistry.get(deviceId) || {
                     manufacturer: parsed.manufacturer,
@@ -258,7 +250,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 5. Android Battery Info
             if (parsed.type === "BATTERY_INFO" && deviceId) {
                 const current = deviceRegistry.get(deviceId) || {
                     manufacturer: "Unknown",
@@ -274,7 +265,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 6. Android Command Acknowledgment
             if (parsed.type === "COMMAND_ACK" && deviceId) {
                 broadcastToDashboards({
                     type: "ACTIVITY",
@@ -283,7 +273,6 @@ wss.on("connection", (socket: WebSocket) => {
                 return;
             }
 
-            // 7. Pong response
             if (parsed.type === "PONG" && deviceId) {
                 broadcastToDashboards({
                     type: "ACTIVITY",
@@ -313,15 +302,6 @@ wss.on("connection", (socket: WebSocket) => {
     });
 });
 
-// Setup terminal input (CLI remains active as backup)
-const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-rl.on("line", (line) => {
-    const cmd = line.trim().toLowerCase();
-    if (cmd === "list") {
-        console.log(`Connected Devices: ${connectedDevices.size}, Dashboards: ${dashboardSockets.size}`);
-    }
-});
-
 httpServer.listen(PORT, () => {
-    console.log(`PhoneBridge server & dashboard running on http://localhost:${PORT}`);
+    console.log(`PhoneBridge server & dashboard running on port ${PORT}`);
 });
