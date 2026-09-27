@@ -33,7 +33,13 @@ interface DeviceInfo {
   isCharging?: boolean;
   location?: DeviceLocation;
   telemetry?: DeviceTelemetry;
-  lastCapturedPhoto?: string; // Stored as data URI or Base64
+  lastCapturedPhoto?: string;
+}
+
+interface ExtWebSocket extends WebSocket {
+  isAlive: boolean;
+  deviceId?: string;
+  clientType?: "PHONE" | "DASHBOARD";
 }
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
@@ -77,9 +83,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     button.alarm-off { background: #64748b; }
     button.alarm-off:hover { background: #475569; }
     
-    .log-box { margin-top: 24px; background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 160px; overflow-y: auto; font-family: monospace; font-size: 12px; color: #a5f3fc; }
+    .log-box { margin-top: 24px; background: #020617; border: 1px solid #1e293b; border-radius: 8px; padding: 12px; height: 180px; overflow-y: auto; font-family: monospace; font-size: 12px; color: #a5f3fc; }
 
-    /* Modal for Camera Previews */
     .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.85); z-index: 100; align-items: center; justify-content: center; }
     .modal-backdrop.active { display: flex; }
     .modal-content { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; max-width: 90vw; max-height: 90vh; text-align: center; }
@@ -106,7 +111,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <h3 id="modalTitle" style="margin-top: 0; color: #f8fafc; font-size: 16px;">Captured Frame</h3>
       <img id="modalImg" src="" alt="Captured Frame" />
       <div style="margin-top: 14px; display: flex; justify-content: space-between; align-items: center;">
-        <a id="downloadLink" download="phonebridge-capture.jpg" style="color: #38bdf8; font-size: 13px; text-decoration: none;">Download Image</a>
+        <a id="downloadLink" download="capture.jpg" style="color: #38bdf8; font-size: 13px; text-decoration: none;">Download Image</a>
         <button onclick="closePhotoModal()" style="background: #475569;">Close</button>
       </div>
     </div>
@@ -258,15 +263,14 @@ const httpServer = http.createServer((req, res) => {
   res.end(DASHBOARD_HTML);
 });
 
-// Configure WebSocket Server to safely accept larger Base64 photo payloads (up to 15MB)
-const wss = new WebSocketServer({ 
+const wss = new WebSocketServer({
   server: httpServer,
-  maxPayload: 15 * 1024 * 1024 
+  maxPayload: 15 * 1024 * 1024,
 });
 
-const connectedDevices = new Map<string, WebSocket>();
+const connectedDevices = new Map<string, ExtWebSocket>();
 const deviceRegistry = new Map<string, DeviceInfo>();
-const dashboardSockets = new Set<WebSocket>();
+const dashboardSockets = new Set<ExtWebSocket>();
 
 function broadcastToDashboards(messageObj: object) {
   const payload = JSON.stringify(messageObj);
@@ -295,33 +299,46 @@ function pushDeviceListUpdate() {
   });
 }
 
-function dispatchCommandToDevice(deviceId: string, commandName: string) {
-  const socket = connectedDevices.get(deviceId);
-  if (!socket || socket.readyState !== WebSocket.OPEN) {
-    console.log(`Device ${deviceId} not available.`);
-    return false;
-  }
+// Active heartbeat to prune dead sockets every 10 seconds
+const pingInterval = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    const extWs = ws as ExtWebSocket;
+    if (extWs.isAlive === false) {
+      if (extWs.deviceId && connectedDevices.get(extWs.deviceId) === extWs) {
+        connectedDevices.delete(extWs.deviceId);
+        deviceRegistry.delete(extWs.deviceId);
+        console.log(`[Heartbeat] Removed unresponsive device: ${extWs.deviceId}`);
+        pushDeviceListUpdate();
+      }
+      return extWs.terminate();
+    }
 
-  socket.send(
-    JSON.stringify({
-      type: "COMMAND",
-      command: commandName,
-    })
-  );
-  return true;
-}
+    extWs.isAlive = false;
+    extWs.ping();
+  });
+}, 10000);
+
+wss.on("close", () => {
+  clearInterval(pingInterval);
+});
 
 wss.on("connection", (socket: WebSocket) => {
-  let clientType: "PHONE" | "DASHBOARD" | null = null;
-  let deviceId: string | null = null;
+  const extWs = socket as ExtWebSocket;
+  extWs.isAlive = true;
 
-  socket.on("message", (data) => {
+  extWs.on("pong", () => {
+    extWs.isAlive = true;
+  });
+
+  extWs.on("message", (data) => {
+    extWs.isAlive = true;
+
     try {
       const parsed = JSON.parse(data.toString());
 
       if (parsed.type === "REGISTER_DASHBOARD") {
-        clientType = "DASHBOARD";
-        dashboardSockets.add(socket);
+        extWs.clientType = "DASHBOARD";
+        dashboardSockets.add(extWs);
         console.log("[Deck] Browser dashboard connected.");
         pushDeviceListUpdate();
         return;
@@ -330,36 +347,60 @@ wss.on("connection", (socket: WebSocket) => {
       if (parsed.type === "DASHBOARD_COMMAND") {
         const targetId = parsed.deviceId;
         const command = parsed.command;
-        const ok = dispatchCommandToDevice(targetId, command);
+        const targetSocket = connectedDevices.get(targetId);
 
-        if (ok) {
-          console.log(`[Deck -> Phone] Dispatched ${command} to ${targetId}`);
+        if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
+          connectedDevices.delete(targetId);
+          deviceRegistry.delete(targetId);
+          pushDeviceListUpdate();
+          broadcastToDashboards({
+            type: "ACTIVITY",
+            message: `Command failed: Device ${targetId.slice(0, 8)} is offline.`,
+          });
+          return;
         }
+
+        targetSocket.send(
+          JSON.stringify({
+            type: "COMMAND",
+            command: command,
+          })
+        );
+        console.log(`[Deck -> Phone] Dispatched ${command} to ${targetId}`);
         return;
       }
 
       if (parsed.type === "REGISTER_DEVICE") {
-        clientType = "PHONE";
-        deviceId = parsed.deviceId;
-        if (!deviceId) return;
+        extWs.clientType = "PHONE";
+        const devId = parsed.deviceId;
+        if (!devId) return;
 
-        connectedDevices.set(deviceId, socket);
-        console.log(`Device registered: ${deviceId}`);
+        extWs.deviceId = devId;
 
-        socket.send(JSON.stringify({ type: "REGISTRATION_SUCCESS", deviceId }));
-        socket.send(JSON.stringify({ type: "COMMAND", command: "GET_DEVICE_INFO" }));
-        socket.send(JSON.stringify({ type: "COMMAND", command: "GET_BATTERY" }));
+        // If an old socket for this device exists, terminate the ghost instance
+        const oldSocket = connectedDevices.get(devId);
+        if (oldSocket && oldSocket !== extWs) {
+          oldSocket.terminate();
+        }
+
+        connectedDevices.set(devId, extWs);
+        console.log(`Device registered: ${devId}`);
+
+        extWs.send(JSON.stringify({ type: "REGISTRATION_SUCCESS", deviceId: devId }));
+        extWs.send(JSON.stringify({ type: "COMMAND", command: "GET_DEVICE_INFO" }));
+        extWs.send(JSON.stringify({ type: "COMMAND", command: "GET_BATTERY" }));
 
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Device connected: ${deviceId.slice(0, 8)}...`,
+          message: `Device connected: ${devId.slice(0, 8)}...`,
         });
         return;
       }
 
-      if (parsed.type === "DEVICE_INFO" && deviceId) {
-        const current = deviceRegistry.get(deviceId) || {
+      if (parsed.type === "DEVICE_INFO" && extWs.deviceId) {
+        const devId = extWs.deviceId;
+        const current = deviceRegistry.get(devId) || {
           manufacturer: parsed.manufacturer,
           model: parsed.model,
           androidVersion: parsed.androidVersion,
@@ -369,14 +410,15 @@ wss.on("connection", (socket: WebSocket) => {
         current.model = parsed.model;
         current.androidVersion = parsed.androidVersion;
         current.sdkInt = parsed.sdkInt;
-        deviceRegistry.set(deviceId, current);
+        deviceRegistry.set(devId, current);
 
         pushDeviceListUpdate();
         return;
       }
 
-      if (parsed.type === "BATTERY_INFO" && deviceId) {
-        const current = deviceRegistry.get(deviceId) || {
+      if (parsed.type === "BATTERY_INFO" && extWs.deviceId) {
+        const devId = extWs.deviceId;
+        const current = deviceRegistry.get(devId) || {
           manufacturer: "Unknown",
           model: "Device",
           androidVersion: "?",
@@ -384,14 +426,15 @@ wss.on("connection", (socket: WebSocket) => {
         };
         current.batteryLevel = parsed.level;
         current.isCharging = parsed.isCharging;
-        deviceRegistry.set(deviceId, current);
+        deviceRegistry.set(devId, current);
 
         pushDeviceListUpdate();
         return;
       }
 
-      if (parsed.type === "TELEMETRY_DATA" && deviceId) {
-        const current = deviceRegistry.get(deviceId) || {
+      if (parsed.type === "TELEMETRY_DATA" && extWs.deviceId) {
+        const devId = extWs.deviceId;
+        const current = deviceRegistry.get(devId) || {
           manufacturer: "Unknown",
           model: "Device",
           androidVersion: "?",
@@ -408,18 +451,19 @@ wss.on("connection", (socket: WebSocket) => {
           availStorageGb: parsed.availStorageGb,
           isScreenOn: parsed.isScreenOn,
         };
-        deviceRegistry.set(deviceId, current);
+        deviceRegistry.set(devId, current);
 
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Telemetry synced from ${deviceId.slice(0, 8)}: ${parsed.networkType}, RAM: ${parsed.usedRamMb}/${parsed.totalRamMb}MB`,
+          message: `Telemetry synced from ${devId.slice(0, 8)}: ${parsed.networkType}, RAM: ${parsed.usedRamMb}/${parsed.totalRamMb}MB`,
         });
         return;
       }
 
-      if (parsed.type === "LOCATION_DATA" && deviceId) {
-        const current = deviceRegistry.get(deviceId) || {
+      if (parsed.type === "LOCATION_DATA" && extWs.deviceId) {
+        const devId = extWs.deviceId;
+        const current = deviceRegistry.get(devId) || {
           manufacturer: "Unknown",
           model: "Device",
           androidVersion: "?",
@@ -433,70 +477,70 @@ wss.on("connection", (socket: WebSocket) => {
           speed: parsed.speed,
           timestamp: parsed.timestamp,
         };
-        deviceRegistry.set(deviceId, current);
+        deviceRegistry.set(devId, current);
 
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Location received from ${deviceId.slice(0, 8)}: ${parsed.latitude.toFixed(4)}, ${parsed.longitude.toFixed(4)}`,
+          message: `Location received from ${devId.slice(0, 8)}: ${parsed.latitude.toFixed(4)}, ${parsed.longitude.toFixed(4)}`,
         });
         return;
       }
 
-      // --- CAMERA HANDLERS ---
-      if ((parsed.type === "PHOTO_DATA" || parsed.type === "IMAGE_CAPTURE") && deviceId) {
+      if ((parsed.type === "PHOTO_DATA" || parsed.type === "IMAGE_CAPTURE") && extWs.deviceId) {
+        const devId = extWs.deviceId;
         const base64Image = parsed.image || parsed.data || parsed.base64;
-        const lensFacing = parsed.lens || "CAMERA";
+        const lensFacing = parsed.lens || parsed.camera || "CAMERA";
 
         if (base64Image) {
-          const current = deviceRegistry.get(deviceId);
+          const current = deviceRegistry.get(devId);
           if (current) {
             current.lastCapturedPhoto = base64Image;
           }
 
           broadcastToDashboards({
             type: "PHOTO_RECEIVED",
-            deviceId: deviceId,
+            deviceId: devId,
             lens: lensFacing,
             image: base64Image,
           });
 
           broadcastToDashboards({
             type: "ACTIVITY",
-            message: `Photo captured via ${lensFacing} by ${deviceId.slice(0, 8)}`,
+            message: `Photo captured via ${lensFacing} by ${devId.slice(0, 8)}`,
           });
         }
         return;
       }
 
-      if (parsed.type === "CAMERA_ERROR" && deviceId) {
+      if (parsed.type === "CAMERA_ERROR" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Camera error from ${deviceId.slice(0, 8)}: ${parsed.error}`,
+          message: `Camera error from ${extWs.deviceId.slice(0, 8)}: ${parsed.error}`,
         });
         return;
       }
 
-      if (parsed.type === "LOCATION_ERROR" && deviceId) {
+      if (parsed.type === "LOCATION_ERROR" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Location failed for ${deviceId.slice(0, 8)}: ${parsed.error}`,
+          message: `Location failed for ${extWs.deviceId.slice(0, 8)}: ${parsed.error}`,
         });
         return;
       }
 
-      if (parsed.type === "COMMAND_ACK" && deviceId) {
+      if (parsed.type === "COMMAND_ACK" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Device ${deviceId.slice(0, 8)} completed ${parsed.command} (${parsed.status})`,
+          message: `Device ${extWs.deviceId.slice(0, 8)} completed ${parsed.command} (${parsed.status})`,
         });
         return;
       }
 
-      if (parsed.type === "PONG" && deviceId) {
+      if (parsed.type === "PONG" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
-          message: `Pong received from ${deviceId.slice(0, 8)} - Online`,
+          message: `Pong received from ${extWs.deviceId.slice(0, 8)} - Online`,
         });
         return;
       }
@@ -506,19 +550,26 @@ wss.on("connection", (socket: WebSocket) => {
   });
 
   socket.on("close", () => {
-    if (clientType === "DASHBOARD") {
-      dashboardSockets.delete(socket);
+    if (extWs.clientType === "DASHBOARD") {
+      dashboardSockets.delete(extWs);
       console.log("[Deck] Browser dashboard disconnected.");
-    } else if (deviceId) {
-      connectedDevices.delete(deviceId);
-      deviceRegistry.delete(deviceId);
-      console.log(`Device disconnected: ${deviceId}`);
-      pushDeviceListUpdate();
-      broadcastToDashboards({
-        type: "ACTIVITY",
-        message: `Device disconnected: ${deviceId.slice(0, 8)}...`,
-      });
+    } else if (extWs.deviceId) {
+      const devId = extWs.deviceId;
+      if (connectedDevices.get(devId) === extWs) {
+        connectedDevices.delete(devId);
+        deviceRegistry.delete(devId);
+        console.log(`Device disconnected: ${devId}`);
+        pushDeviceListUpdate();
+        broadcastToDashboards({
+          type: "ACTIVITY",
+          message: `Device disconnected: ${devId.slice(0, 8)}...`,
+        });
+      }
     }
+  });
+
+  socket.on("error", (err) => {
+    console.error("Socket error encountered:", err);
   });
 });
 
