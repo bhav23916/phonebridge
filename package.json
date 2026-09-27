@@ -1,0 +1,22 @@
+{
+  "name": "phonebridge-server",
+  "version": "1.0.0",
+  "description": "PhoneBridge WebSocket & Web Dashboard Server",
+  "main": "src/server.ts",
+  "scripts": {
+    "start": "tsx src/server.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "tsx": "^4.23.15",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "^7.0.2"
+  }
+}
