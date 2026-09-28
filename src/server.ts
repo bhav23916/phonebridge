@@ -3,6 +3,21 @@ import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 
+/*
+ * Liveness tuning.
+ *
+ * The server sends a protocol-level ping every HEARTBEAT_INTERVAL_MS.
+ * A socket is only considered dead if NOTHING (pong, client ping, or
+ * application message) has been received from it for STALE_AFTER_MS.
+ *
+ * The Android client (OkHttp) sends its own protocol ping every 25s, and
+ * the `ws` library auto-answers it, so a healthy phone produces traffic at
+ * least that often. 60s gives it room for a couple of delayed frames while
+ * the screen is off, without letting real zombies live forever.
+ */
+const HEARTBEAT_INTERVAL_MS = 15000;
+const STALE_AFTER_MS = 60000;
+
 interface DeviceLocation {
   latitude: number;
   longitude: number;
@@ -37,7 +52,7 @@ interface DeviceInfo {
 }
 
 interface ExtWebSocket extends WebSocket {
-  isAlive: boolean;
+  lastSeen: number;
   deviceId?: string;
   clientType?: "PHONE" | "DASHBOARD";
 }
@@ -305,12 +320,19 @@ function pushDeviceListUpdate() {
   });
 }
 
-// Active heartbeat to prune dead sockets every 10 seconds
+// Liveness sweeper.
+//
+// A socket is removed only when NOTHING has been received from it for
+// STALE_AFTER_MS. Any pong, any client-originated ping, or any application
+// message counts as proof of life (see the handlers in the connection block).
 const pingInterval = setInterval(() => {
+  const now = Date.now();
+
   wss.clients.forEach((ws) => {
     const extWs = ws as ExtWebSocket;
+    const silentMs = now - extWs.lastSeen;
 
-    if (extWs.isAlive === false) {
+    if (silentMs > STALE_AFTER_MS) {
 
       if (
         extWs.deviceId &&
@@ -320,19 +342,28 @@ const pingInterval = setInterval(() => {
         deviceRegistry.delete(extWs.deviceId);
 
         console.log(
-          `[Heartbeat] Removed unresponsive device: ${extWs.deviceId}`
+          `[Heartbeat] Removed unresponsive device: ${extWs.deviceId} ` +
+          `(silent for ${Math.round(silentMs / 1000)}s)`
         );
 
         pushDeviceListUpdate();
+
+        broadcastToDashboards({
+          type: "ACTIVITY",
+          message:
+            `Device ${extWs.deviceId.slice(0, 8)} timed out ` +
+            `(silent ${Math.round(silentMs / 1000)}s)`,
+        });
       }
 
       return extWs.terminate();
     }
 
-    extWs.isAlive = false;
-    extWs.ping();
+    if (extWs.readyState === WebSocket.OPEN) {
+      extWs.ping();
+    }
   });
-}, 10000);
+}, HEARTBEAT_INTERVAL_MS);
 
 wss.on("close", () => {
   clearInterval(pingInterval);
@@ -342,15 +373,22 @@ wss.on("connection", (socket: WebSocket) => {
 
   const extWs = socket as ExtWebSocket;
 
-  extWs.isAlive = true;
+  extWs.lastSeen = Date.now();
 
-  extWs.on("pong", () => {
-    extWs.isAlive = true;
-  });
+  const markSeen = () => {
+    extWs.lastSeen = Date.now();
+  };
+
+  // Answer to our server-side ping.
+  extWs.on("pong", markSeen);
+
+  // Client-originated protocol ping (OkHttp pingInterval). The ws library
+  // replies with a pong automatically; here we only record proof of life.
+  extWs.on("ping", markSeen);
 
   extWs.on("message", (data) => {
 
-    extWs.isAlive = true;
+    markSeen();
 
     try {
 
@@ -482,6 +520,10 @@ wss.on("connection", (socket: WebSocket) => {
        * These events come from PhoneBridgeService /
        * WebSocketClient and allow us to see what happened
        * immediately before a device disconnects.
+       *
+       * NOTE: they are only accepted AFTER REGISTER_DEVICE, because
+       * extWs.deviceId is required. The client sends them after
+       * registering.
        */
       if (
         parsed.type === "SERVICE_EVENT" &&
@@ -806,7 +848,7 @@ wss.on("connection", (socket: WebSocket) => {
     }
   });
 
-  socket.on("close", () => {
+  socket.on("close", (code: number, reason: Buffer) => {
 
     if (
       extWs.clientType === "DASHBOARD"
@@ -838,8 +880,13 @@ wss.on("connection", (socket: WebSocket) => {
           devId
         );
 
+        const silentS =
+          Math.round((Date.now() - extWs.lastSeen) / 1000);
+
         console.log(
-          `Device disconnected: ${devId}`
+          `Device disconnected: ${devId} ` +
+          `(code=${code} reason="${reason.toString()}" ` +
+          `lastSeen=${silentS}s ago)`
         );
 
         pushDeviceListUpdate();
@@ -847,7 +894,8 @@ wss.on("connection", (socket: WebSocket) => {
         broadcastToDashboards({
           type: "ACTIVITY",
           message:
-            `Device disconnected: ${devId.slice(0, 8)}...`,
+            `Device disconnected: ${devId.slice(0, 8)}... ` +
+            `(code ${code}, last seen ${silentS}s ago)`,
         });
       }
     }
