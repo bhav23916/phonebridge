@@ -63,9 +63,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
-    header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #334155; padding-bottom: 16px; margin-bottom: 24px; }
-    h1 { margin: 0; font-size: 22px; font-weight: 700; color: #38bdf8; }
+    body { min-height: 100vh; background: radial-gradient(ellipse at 50% -18%, #18395a 0, #101a2c 42%, #0b1220 100%); color: #f8fafc; margin: 0; padding: 24px clamp(18px, 4vw, 56px); }
+    header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid rgba(148,163,184,.18); padding-bottom: 16px; margin-bottom: 24px; }
+    h1 { margin: 0; font-size: 22px; font-weight: 700; color: #38bdf8; letter-spacing: -.4px; }
     .status-badge { background: #1e293b; padding: 6px 12px; border-radius: 9999px; font-size: 13px; border: 1px solid #475569; }
     .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(380px, 1fr)); gap: 16px; }
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
@@ -112,10 +112,22 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .records-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .records-table th, .records-table td { border: 1px solid #334155; padding: 8px; vertical-align: top; text-align: left; overflow-wrap: anywhere; }
     .records-table th { position: sticky; top: 0; background: #0f172a; color: #7dd3fc; }
-    .auth-panel { max-width: 480px; margin: 12vh auto; padding: 28px; background: #1e293b; border: 1px solid #334155; border-radius: 16px; }
-    .auth-panel p { color: #cbd5e1; line-height: 1.5; }
-    .auth-panel button { width: 100%; padding: 12px 16px; font-size: 14px; }
-    .auth-error { color: #fca5a5; min-height: 20px; font-size: 13px; }
+    .auth-shell { max-width: 1000px; min-height: min(680px, calc(100vh - 140px)); margin: 3vh auto 0; display: grid; grid-template-columns: 1.1fr .9fr; overflow: hidden; border: 1px solid rgba(148,163,184,.18); border-radius: 24px; background: rgba(15,23,42,.76); box-shadow: 0 28px 80px rgba(0,0,0,.32); }
+    .auth-intro { display: flex; flex-direction: column; justify-content: space-between; padding: clamp(28px, 5vw, 64px); background: linear-gradient(145deg, rgba(14,165,233,.18), rgba(30,41,59,.25) 58%, rgba(99,102,241,.12)); }
+    .brand-mark { display: inline-grid; place-items: center; width: 46px; height: 46px; border-radius: 14px; background: linear-gradient(135deg,#38bdf8,#6366f1); color: #071525; font-weight: 800; letter-spacing: -1px; box-shadow: 0 8px 24px rgba(56,189,248,.2); }
+    .auth-intro h2 { max-width: 440px; margin: 28px 0 14px; font-size: clamp(32px, 4vw, 48px); line-height: 1.08; letter-spacing: -1.5px; }
+    .auth-intro p { max-width: 430px; color: #b9c7d9; line-height: 1.7; font-size: 15px; }
+    .intro-foot { color: #91a3b9; font-size: 12px; }
+    .auth-panel { align-self: center; max-width: 440px; width: calc(100% - 48px); margin: 36px auto; padding: clamp(24px, 4vw, 40px); background: rgba(30,41,59,.8); border: 1px solid rgba(148,163,184,.18); border-radius: 20px; }
+    .auth-panel h3 { margin: 0 0 9px; font-size: 23px; letter-spacing: -.5px; }
+    .auth-panel p { margin: 0 0 24px; color: #b8c5d6; line-height: 1.55; font-size: 14px; }
+    .auth-panel button { width: 100%; min-height: 48px; padding: 12px 16px; font-size: 14px; border: 1px solid rgba(147,197,253,.45); border-radius: 10px; background: #2563eb; box-shadow: 0 8px 22px rgba(37,99,235,.2); }
+    .auth-panel button:hover { background: #1d4ed8; transform: translateY(-1px); }
+    .auth-panel button:disabled { opacity: .7; cursor: wait; transform: none; }
+    .auth-error { color: #fca5a5; min-height: 0; margin-top: 12px; font-size: 13px; line-height: 1.45; }
+    .auth-error:not(:empty) { padding: 10px 12px; border-radius: 8px; background: rgba(127,29,29,.22); border: 1px solid rgba(248,113,113,.2); }
+    .auth-note { margin-top: 18px; color: #8293aa; font-size: 12px; line-height: 1.5; text-align: center; }
+    @media (max-width: 720px) { body { padding: 16px; } .auth-shell { min-height: auto; grid-template-columns: 1fr; margin-top: 18px; } .auth-intro { padding: 24px; } .auth-intro h2 { font-size: 30px; margin: 20px 0 8px; } .auth-intro p { margin: 0; } .intro-foot { display: none; } .auth-panel { width: calc(100% - 32px); margin: 16px auto; padding: 24px; } }
     .account-actions { display: flex; align-items: center; gap: 10px; color: #cbd5e1; font-size: 13px; }
     .pair-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 18px; padding: 14px 16px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; }
     .pair-panel input { width: 150px; padding: 9px 10px; color: #f8fafc; background: #090d16; border: 1px solid #475569; border-radius: 6px; letter-spacing: 2px; }
@@ -131,11 +143,22 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
   </header>
 
-  <section class="auth-panel" id="authPanel">
-    <h2>Sign in to PhoneBridge</h2>
-    <p>Sign in with Google to access devices paired to your account.</p>
-    <button id="googleSignIn" type="button" onclick="signInWithGoogle()">Continue with Google</button>
-    <div class="auth-error" id="authError" role="status"></div>
+  <section class="auth-shell" id="authPanel">
+    <div class="auth-intro">
+      <div class="brand-mark" aria-hidden="true">PB</div>
+      <div>
+        <h2>Your devices,<br>within reach.</h2>
+        <p>PhoneBridge brings your connected phone status and tools together in one secure dashboard.</p>
+      </div>
+      <div class="intro-foot">PRIVATE DEVICE DASHBOARD&nbsp; · &nbsp;SECURE SIGN-IN</div>
+    </div>
+    <div class="auth-panel">
+      <h3>Welcome back</h3>
+      <p>Sign in with Google to open your PhoneBridge workspace and paired devices.</p>
+      <button id="googleSignIn" type="button" onclick="signInWithGoogle()">Continue with Google</button>
+      <div class="auth-error" id="authError" role="status" aria-live="polite"></div>
+      <div class="auth-note">Only devices paired to your account appear in your dashboard.</div>
+    </div>
   </section>
 
   <main id="dashboardContent" style="display:none">
@@ -198,7 +221,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
     function escapeHtml(value) {
       return String(value == null ? "" : value).replace(/[&<>"']/g, character => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\\\"": "&quot;", "'": "&#39;"
       })[character]);
     }
 
@@ -272,16 +295,33 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
 
     async function signInWithGoogle() {
+      const button = document.getElementById("googleSignIn");
       if (!supabaseClient) {
-        setAuthError("The dashboard authentication settings are missing. Ask the server administrator to configure them.");
+        setAuthError(!window.supabase
+          ? "The sign-in library did not load. Check your connection, refresh the page, and try again."
+          : "The server's Supabase settings are missing. Check the Render environment settings.");
         return;
       }
-      setAuthError("");
-      const { error } = await supabaseClient.auth.signInWithOAuth({
-        provider: "google",
-        options: { redirectTo: window.location.origin + "/" }
-      });
-      if (error) setAuthError(error.message);
+      button.disabled = true;
+      button.textContent = "Connecting to Google…";
+      setAuthError("A Google sign-in page should open in a moment.");
+      try {
+        const startingUrl = window.location.href;
+        const { data, error } = await supabaseClient.auth.signInWithOAuth({
+          provider: "google",
+          options: { redirectTo: window.location.origin + "/" }
+        });
+        if (error) throw error;
+        if (data && data.url && window.location.href === startingUrl) {
+          window.location.assign(data.url);
+          return;
+        }
+        if (!data || !data.url) throw new Error("Google sign-in did not return a redirect URL. Check that Google is enabled in Supabase.");
+      } catch (error) {
+        setAuthError(error && error.message ? error.message : "Could not start Google sign-in. Please refresh and try again.");
+        button.disabled = false;
+        button.textContent = "Continue with Google";
+      }
     }
 
     async function signOut() {
