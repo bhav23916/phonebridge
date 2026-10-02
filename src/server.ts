@@ -1,4 +1,5 @@
 import http from "http";
+import { createHash, randomInt } from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
@@ -42,14 +43,24 @@ interface DeviceInfo {
 interface ExtWebSocket extends WebSocket {
   isAlive: boolean;
   deviceId?: string;
-  clientType?: "PHONE" | "DASHBOARD";
+  clientType?: "PHONE" | "PENDING_PHONE" | "DASHBOARD";
+  userId?: string;
+  workspaceIds?: string[];
+  authExpiresAt?: number;
+  deviceTokenHash?: string;
+  pairingCode?: string;
 }
+
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
+const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || "";
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <title>PhoneBridge Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <style>
     * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
     body { background: #0f172a; color: #f8fafc; margin: 0; padding: 24px; }
@@ -101,15 +112,40 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .records-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .records-table th, .records-table td { border: 1px solid #334155; padding: 8px; vertical-align: top; text-align: left; overflow-wrap: anywhere; }
     .records-table th { position: sticky; top: 0; background: #0f172a; color: #7dd3fc; }
+    .auth-panel { max-width: 480px; margin: 12vh auto; padding: 28px; background: #1e293b; border: 1px solid #334155; border-radius: 16px; }
+    .auth-panel p { color: #cbd5e1; line-height: 1.5; }
+    .auth-panel button { width: 100%; padding: 12px 16px; font-size: 14px; }
+    .auth-error { color: #fca5a5; min-height: 20px; font-size: 13px; }
+    .account-actions { display: flex; align-items: center; gap: 10px; color: #cbd5e1; font-size: 13px; }
+    .pair-panel { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 18px; padding: 14px 16px; background: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+    .pair-panel input { width: 150px; padding: 9px 10px; color: #f8fafc; background: #090d16; border: 1px solid #475569; border-radius: 6px; letter-spacing: 2px; }
   </style>
 </head>
 <body>
   <header>
     <h1>PhoneBridge Command Deck</h1>
-    <div class="status-badge" id="deckStatus">Connecting to deck...</div>
+    <div class="account-actions" id="accountActions" style="display:none">
+      <span id="accountEmail"></span>
+      <button type="button" onclick="signOut()">Sign out</button>
+      <div class="status-badge" id="deckStatus">Connecting to deck...</div>
+    </div>
   </header>
 
-  <main>
+  <section class="auth-panel" id="authPanel">
+    <h2>Sign in to PhoneBridge</h2>
+    <p>Sign in with Google to access devices paired to your account.</p>
+    <button id="googleSignIn" type="button" onclick="signInWithGoogle()">Continue with Google</button>
+    <div class="auth-error" id="authError" role="status"></div>
+  </section>
+
+  <main id="dashboardContent" style="display:none">
+    <section class="pair-panel">
+      <strong>Pair a phone you own</strong>
+      <span>Enter the 6-digit code shown in the PhoneBridge app.</span>
+      <input id="pairCode" inputmode="numeric" autocomplete="one-time-code" maxlength="6" aria-label="Phone pairing code" placeholder="000000">
+      <button type="button" onclick="pairDevice()">Pair device</button>
+      <span id="pairStatus" role="status"></span>
+    </section>
     <div class="grid" id="deviceList">
       <div style="color: #64748b; font-size: 14px;">No phones connected yet.</div>
     </div>
@@ -140,8 +176,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   </div>
 
   <script>
+    const SUPABASE_URL = __SUPABASE_URL__;
+    const SUPABASE_PUBLISHABLE_KEY = __SUPABASE_PUBLISHABLE_KEY__;
+    const supabaseClient = (window.supabase && SUPABASE_URL && SUPABASE_PUBLISHABLE_KEY)
+      ? window.supabase.createClient(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
+      : null;
     const protocol = window.location.protocol === "https:" ? "wss://" : "ws://";
-    const ws = new WebSocket(protocol + window.location.host);
+    let ws = null;
+    let currentSession = null;
+    let dashboardAuthenticated = false;
     const deviceListEl = document.getElementById("deviceList");
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
@@ -151,6 +194,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const line = document.createElement("div");
       line.textContent = "[" + new Date().toLocaleTimeString() + "] " + text;
       activityLogEl.prepend(line);
+    }
+
+    function escapeHtml(value) {
+      return String(value == null ? "" : value).replace(/[&<>"']/g, character => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;"
+      })[character]);
     }
 
     function showPhotoModal(title, base64Data) {
@@ -218,25 +267,84 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       showRecordsModal("Notifications — " + deviceId.slice(0, 8), notificationsByDevice.get(deviceId) || []);
     }
 
-    ws.onopen = () => {
-      deckStatusEl.textContent = "● Deck Connected";
-      deckStatusEl.style.borderColor = "#22c55e";
-      deckStatusEl.style.color = "#4ade80";
-      ws.send(JSON.stringify({ type: "REGISTER_DASHBOARD" }));
-      logEvent("Dashboard authenticated with server.");
-    };
+    function setAuthError(message) {
+      document.getElementById("authError").textContent = message || "";
+    }
 
-    ws.onclose = () => {
-      deckStatusEl.textContent = "● Deck Offline";
-      deckStatusEl.style.borderColor = "#ef4444";
-      deckStatusEl.style.color = "#f87171";
-      logEvent("Lost connection to server.");
-    };
+    async function signInWithGoogle() {
+      if (!supabaseClient) {
+        setAuthError("The dashboard authentication settings are missing. Ask the server administrator to configure them.");
+        return;
+      }
+      setAuthError("");
+      const { error } = await supabaseClient.auth.signInWithOAuth({
+        provider: "google",
+        options: { redirectTo: window.location.origin + "/" }
+      });
+      if (error) setAuthError(error.message);
+    }
 
-    ws.onmessage = (event) => {
+    async function signOut() {
+      dashboardAuthenticated = false;
+      currentSession = null;
+      if (ws) { ws.close(); ws = null; }
+      if (supabaseClient) await supabaseClient.auth.signOut();
+      document.getElementById("authPanel").style.display = "block";
+      document.getElementById("dashboardContent").style.display = "none";
+      document.getElementById("accountActions").style.display = "none";
+      deckStatusEl.textContent = "Signed out";
+    }
+
+    function pairDevice() {
+      const code = document.getElementById("pairCode").value.trim();
+      const status = document.getElementById("pairStatus");
+      if (!/^\\d{6}$/.test(code)) { status.textContent = "Enter the 6-digit code shown in the phone app."; return; }
+      if (!ws || ws.readyState !== WebSocket.OPEN || !dashboardAuthenticated) { status.textContent = "Connect to the dashboard first."; return; }
+      ws.send(JSON.stringify({ type: "PAIR_DEVICE", code }));
+      status.textContent = "Checking pairing code…";
+    }
+
+    function connectDashboard(session) {
+      currentSession = session;
+      if (ws) { try { ws.close(); } catch (_) {} }
+      const socket = new WebSocket(protocol + window.location.host);
+      ws = socket;
+
+      socket.onopen = () => {
+        deckStatusEl.textContent = "Authenticating...";
+        socket.send(JSON.stringify({ type: "DASHBOARD_AUTH", accessToken: session.access_token }));
+      };
+
+      socket.onclose = () => {
+        if (ws !== socket) return;
+        dashboardAuthenticated = false;
+        deckStatusEl.textContent = "● Deck Offline";
+        deckStatusEl.style.borderColor = "#ef4444";
+        deckStatusEl.style.color = "#f87171";
+        if (currentSession) logEvent("Lost connection to server.");
+      };
+
+      socket.onmessage = (event) => {
+      if (ws !== socket) return;
       const msg = JSON.parse(event.data);
 
-      if (msg.type === "DEVICE_UPDATE") {
+      if (msg.type === "DASHBOARD_AUTHENTICATED") {
+        dashboardAuthenticated = true;
+        document.getElementById("authPanel").style.display = "none";
+        document.getElementById("dashboardContent").style.display = "block";
+        document.getElementById("accountActions").style.display = "flex";
+        document.getElementById("accountEmail").textContent = session.user.email || "Signed in";
+        deckStatusEl.textContent = "● Deck Connected";
+        deckStatusEl.style.borderColor = "#22c55e";
+        deckStatusEl.style.color = "#4ade80";
+        logEvent("Signed in and connected to PhoneBridge.");
+      } else if (msg.type === "AUTH_ERROR") {
+        setAuthError(msg.message || "Sign-in could not be verified by the server.");
+        ws.close();
+      } else if (msg.type === "PAIR_RESULT") {
+        document.getElementById("pairStatus").textContent = msg.message || (msg.ok ? "Phone paired." : "Pairing failed.");
+        if (msg.ok) document.getElementById("pairCode").value = "";
+      } else if (msg.type === "DEVICE_UPDATE") {
         renderDevices(msg.devices);
       } else if (msg.type === "ACTIVITY") {
         // Screenshot status, completion, and error events are also
@@ -276,7 +384,26 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         }
         logEvent("Notification from " + (notification.package || "app") + ": " + (notification.title || notification.text || "New notification"));
       }
-    };
+      };
+    }
+
+    if (supabaseClient) {
+      supabaseClient.auth.onAuthStateChange((event, session) => {
+        if (session) {
+          setAuthError("");
+          connectDashboard(session);
+        } else {
+          currentSession = null;
+          dashboardAuthenticated = false;
+          if (ws) { ws.close(); ws = null; }
+          document.getElementById("authPanel").style.display = "block";
+          document.getElementById("dashboardContent").style.display = "none";
+          document.getElementById("accountActions").style.display = "none";
+        }
+      });
+    } else {
+      setAuthError("Server Supabase configuration is missing.");
+    }
 
     function sendCommand(deviceId, command, options) {
       const payload = {
@@ -308,11 +435,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           : "Unknown";
 
         const t = d.telemetry;
+        const latitude = Number(d.location && d.location.latitude);
+        const longitude = Number(d.location && d.location.longitude);
+        const accuracy = Number(d.location && d.location.accuracy);
         const telemetryHtml = t ? \`
           <div class="telemetry-grid">
             <div class="tele-stat">
               <div class="label">Network / SSID</div>
-              <div class="val">\${t.networkType} \${t.wifiSSID !== "N/A" ? "(" + t.wifiSSID + ")" : ""}</div>
+              <div class="val">\${escapeHtml(t.networkType)} \${t.wifiSSID !== "N/A" ? "(" + escapeHtml(t.wifiSSID) + ")" : ""}</div>
             </div>
             <div class="tele-stat">
               <div class="label">Screen State</div>
@@ -320,30 +450,30 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             </div>
             <div class="tele-stat">
               <div class="label">RAM Usage</div>
-              <div class="val">\${t.usedRamMb}MB / \${t.totalRamMb}MB</div>
+              <div class="val">\${escapeHtml(t.usedRamMb)}MB / \${escapeHtml(t.totalRamMb)}MB</div>
             </div>
             <div class="tele-stat">
               <div class="label">Free Storage</div>
-              <div class="val">\${t.availStorageGb}GB / \${t.totalStorageGb}GB</div>
+              <div class="val">\${escapeHtml(t.availStorageGb)}GB / \${escapeHtml(t.totalStorageGb)}GB</div>
             </div>
           </div>
         \` : '';
 
-        const locHtml = d.location ? \`
+        const locHtml = d.location && Number.isFinite(latitude) && Number.isFinite(longitude) ? \`
           <div class="loc-box">
-            <div>GPS: \${d.location.latitude.toFixed(6)}, \${d.location.longitude.toFixed(6)}</div>
-            <div>Accuracy: ±\${d.location.accuracy ? d.location.accuracy.toFixed(1) : "?"}m</div>
-            <a href="https://www.google.com/maps?q=\${d.location.latitude},\${d.location.longitude}" target="_blank">Open in Google Maps →</a>
+            <div>GPS: \${latitude.toFixed(6)}, \${longitude.toFixed(6)}</div>
+            <div>Accuracy: ±\${Number.isFinite(accuracy) && accuracy ? accuracy.toFixed(1) : "?"}m</div>
+            <a href="https://www.google.com/maps?q=\${latitude},\${longitude}" target="_blank" rel="noopener">Open in Google Maps →</a>
           </div>
         \` : '<div class="loc-box" style="color: #64748b;">GPS: Not acquired yet</div>';
 
         return \`
           <div class="card">
-            <h2>\${d.manufacturer || "Android"} \${d.model || "Device"}</h2>
+            <h2>\${escapeHtml(d.manufacturer || "Android")} \${escapeHtml(d.model || "Device")}</h2>
             <div class="device-meta">
-              <div>OS: Android \${d.androidVersion || "?"} (SDK \${d.sdkInt || "?"})</div>
-              <div>Battery: \${batteryStr}</div>
-              <div style="margin-top: 4px;">ID: <span class="meta-tag">\${d.id}</span></div>
+              <div>OS: Android \${escapeHtml(d.androidVersion || "?")} (SDK \${escapeHtml(d.sdkInt || "?")})</div>
+              <div>Battery: \${escapeHtml(batteryStr)}</div>
+              <div style="margin-top: 4px;">ID: <span class="meta-tag">\${escapeHtml(d.id)}</span></div>
               \${telemetryHtml}
               \${locHtml}
               <div class="screen-status" style="color: \${d.screenCaptureActive ? '#4ade80' : '#94a3b8'}">
@@ -383,8 +513,13 @@ const httpServer = http.createServer((req, res) => {
     return;
   }
 
-  res.writeHead(200, { "Content-Type": "text/html" });
-  res.end(DASHBOARD_HTML);
+  res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+  const safeConfigValue = (value: string) => JSON.stringify(value).replace(/</g, "\\u003c");
+  res.end(
+    DASHBOARD_HTML
+      .replace("__SUPABASE_URL__", safeConfigValue(SUPABASE_URL))
+      .replace("__SUPABASE_PUBLISHABLE_KEY__", safeConfigValue(SUPABASE_PUBLISHABLE_KEY))
+  );
 });
 
 const wss = new WebSocketServer({
@@ -394,39 +529,247 @@ const wss = new WebSocketServer({
 
 const connectedDevices = new Map<string, ExtWebSocket>();
 const deviceRegistry = new Map<string, DeviceInfo>();
+const deviceOwnerIds = new Map<string, string>();
 const dashboardSockets = new Set<ExtWebSocket>();
+const pendingPairings = new Map<string, { socket: ExtWebSocket; expiresAt: number }>();
+const pairingAttemptsByUser = new Map<string, { count: number; windowStartedAt: number }>();
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+async function authenticateSupabaseUser(accessToken: string): Promise<string | null> {
+  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY || !accessToken) return null;
+  try {
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    if (!response.ok) return null;
+    const user = await response.json() as { id?: string };
+    return typeof user.id === "string" ? user.id : null;
+  } catch (error) {
+    console.error("Supabase token verification failed:", error);
+    return null;
+  }
+}
+
+function getVerifiedTokenExpiry(accessToken: string): number | null {
+  try {
+    const payload = JSON.parse(Buffer.from(accessToken.split(".")[1], "base64url").toString("utf8")) as { exp?: number };
+    return typeof payload.exp === "number" ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+async function getUserWorkspaceIds(userId: string): Promise<string[]> {
+  const url = new URL(`${SUPABASE_URL}/rest/v1/phonebridge_workspace_members`);
+  url.searchParams.set("user_id", `eq.${userId}`);
+  url.searchParams.set("select", "workspace_id");
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    },
+  });
+  if (!response.ok) {
+    console.error("Could not load account workspaces:", response.status, await response.text());
+    return [];
+  }
+  const rows = await response.json() as Array<{ workspace_id: string }>;
+  return rows.map((row) => row.workspace_id);
+}
+
+async function getPairedDevice(deviceId: string): Promise<{ workspaceId: string; tokenHash: string } | null> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return null;
+  const url = new URL(`${SUPABASE_URL}/rest/v1/phonebridge_devices`);
+  url.searchParams.set("device_id", `eq.${deviceId}`);
+  url.searchParams.set("select", "workspace_id,device_token_hash");
+  url.searchParams.set("limit", "1");
+  const response = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+    },
+  });
+  if (!response.ok) {
+    console.error("Could not load paired device:", response.status, await response.text());
+    throw new Error(`Device lookup returned ${response.status}`);
+  }
+  const rows = await response.json() as Array<{ workspace_id: string; device_token_hash: string }>;
+  const row = rows[0];
+  return row ? { workspaceId: row.workspace_id, tokenHash: row.device_token_hash } : null;
+}
+
+async function saveDevicePairing(deviceId: string, workspaceId: string, pairedBy: string, tokenHash: string): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return false;
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/phonebridge_devices`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify({ device_id: deviceId, workspace_id: workspaceId, paired_by: pairedBy, device_token_hash: tokenHash }),
+  });
+  if (!response.ok) {
+    console.error("Could not save device pairing:", response.status, await response.text());
+    return false;
+  }
+  return true;
+}
+
+function issuePairingCode(socket: ExtWebSocket) {
+  if (!socket.deviceId || !socket.deviceTokenHash || socket.readyState !== WebSocket.OPEN) return;
+  if (socket.pairingCode) pendingPairings.delete(socket.pairingCode);
+  let code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  while (pendingPairings.has(code)) code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+  const expiresAt = Date.now() + 10 * 60 * 1000;
+  socket.clientType = "PENDING_PHONE";
+  socket.pairingCode = code;
+  pendingPairings.set(code, { socket, expiresAt });
+  socket.send(JSON.stringify({ type: "PAIRING_REQUIRED", code, expiresAt }));
+}
+
+function registerPairedDevice(socket: ExtWebSocket, deviceId: string, workspaceId: string) {
+  socket.clientType = "PHONE";
+  socket.deviceId = deviceId;
+  deviceOwnerIds.set(deviceId, workspaceId);
+  const previous = connectedDevices.get(deviceId);
+  if (previous && previous !== socket) previous.terminate();
+  connectedDevices.set(deviceId, socket);
+  if (!deviceRegistry.has(deviceId)) {
+    deviceRegistry.set(deviceId, {
+      manufacturer: "Unknown",
+      model: "Device",
+      androidVersion: "?",
+      sdkInt: 0,
+    });
+  }
+  socket.send(JSON.stringify({ type: "REGISTRATION_SUCCESS", deviceId }));
+  socket.send(JSON.stringify({ type: "COMMAND", command: "GET_DEVICE_INFO" }));
+  socket.send(JSON.stringify({ type: "COMMAND", command: "GET_BATTERY" }));
+  socket.send(JSON.stringify({ type: "COMMAND", command: "GET_TELEMETRY" }));
+  pushDeviceListUpdate();
+  broadcastToDashboards({
+    type: "ACTIVITY",
+    deviceId,
+    message: `Device connected: ${deviceId.slice(0, 8)}...`,
+  });
+}
+
+async function registerPhone(socket: ExtWebSocket, message: Record<string, unknown>) {
+  const deviceId = typeof message.deviceId === "string" ? message.deviceId : "";
+  const deviceToken = typeof message.deviceToken === "string" ? message.deviceToken : "";
+  if (!/^[0-9a-fA-F-]{36}$/.test(deviceId) || deviceToken.length < 32 || deviceToken.length > 256) {
+    socket.close(1008, "Invalid device credentials");
+    return;
+  }
+  if (!SUPABASE_SECRET_KEY || !SUPABASE_URL) {
+    socket.close(1011, "Server database is not configured");
+    return;
+  }
+
+  const tokenHash = sha256(deviceToken);
+  let pairedDevice: { workspaceId: string; tokenHash: string } | null;
+  try {
+    pairedDevice = await getPairedDevice(deviceId);
+  } catch (error) {
+    console.error("Device pairing lookup failed:", error);
+    socket.close(1011, "Device verification failed");
+    return;
+  }
+  if (pairedDevice) {
+    if (pairedDevice.tokenHash !== tokenHash) {
+      socket.close(1008, "Device credential rejected");
+      return;
+    }
+    registerPairedDevice(socket, deviceId, pairedDevice.workspaceId);
+    return;
+  }
+
+  // Unpaired phones stay isolated: they send no telemetry and accept no commands.
+  socket.deviceId = deviceId;
+  socket.deviceTokenHash = tokenHash;
+  issuePairingCode(socket);
+}
+
+async function pairPendingDevice(dashboard: ExtWebSocket, code: string) {
+  if (!dashboard.userId || !dashboard.workspaceIds?.length) return;
+  const pending = pendingPairings.get(code);
+  if (!pending || pending.expiresAt <= Date.now() || pending.socket.readyState !== WebSocket.OPEN) {
+    pendingPairings.delete(code);
+    dashboard.send(JSON.stringify({ type: "PAIR_RESULT", ok: false, message: "Code not found or expired. Use the current code shown in PhoneBridge." }));
+    return;
+  }
+  const phone = pending.socket;
+  const deviceId = phone.deviceId;
+  if (!deviceId || !phone.deviceTokenHash || phone.clientType !== "PENDING_PHONE") {
+    pendingPairings.delete(code);
+    dashboard.send(JSON.stringify({ type: "PAIR_RESULT", ok: false, message: "This phone is no longer waiting to be paired." }));
+    return;
+  }
+  const workspaceId = dashboard.workspaceIds[0];
+  const saved = await saveDevicePairing(deviceId, workspaceId, dashboard.userId, phone.deviceTokenHash);
+  if (!saved) {
+    dashboard.send(JSON.stringify({ type: "PAIR_RESULT", ok: false, message: "Could not save pairing. Check the Supabase server key and migration." }));
+    return;
+  }
+  pendingPairings.delete(code);
+  phone.pairingCode = undefined;
+  dashboard.send(JSON.stringify({ type: "PAIR_RESULT", ok: true, message: "Phone paired to your account." }));
+  registerPairedDevice(phone, deviceId, workspaceId);
+}
 
 function broadcastToDashboards(messageObj: object) {
   const payload = JSON.stringify(messageObj);
+  const deviceId = (messageObj as { deviceId?: string }).deviceId;
+  const workspaceId = deviceId ? deviceOwnerIds.get(deviceId) : undefined;
   dashboardSockets.forEach((dash) => {
-    if (dash.readyState === WebSocket.OPEN) {
+    if (dash.readyState === WebSocket.OPEN && dash.userId && (dash.authExpiresAt || 0) > Date.now() && (!deviceId || dash.workspaceIds?.includes(workspaceId || ""))) {
       dash.send(payload);
     }
   });
 }
 
 function pushDeviceListUpdate() {
-  const devices: Array<{ id: string } & Partial<DeviceInfo>> = [];
-  connectedDevices.forEach((_, id) => {
-    const info = deviceRegistry.get(id) || {
-      manufacturer: "Unknown",
-      model: "Device",
-      androidVersion: "?",
-      sdkInt: 0,
-    };
-    devices.push({ id, ...info });
-  });
-
-  broadcastToDashboards({
-    type: "DEVICE_UPDATE",
-    devices: devices,
+  dashboardSockets.forEach((dash) => {
+    if (!dash.userId || dash.readyState !== WebSocket.OPEN || (dash.authExpiresAt || 0) <= Date.now()) return;
+    const devices: Array<{ id: string } & Partial<DeviceInfo>> = [];
+    connectedDevices.forEach((_, id) => {
+      if (!dash.workspaceIds?.includes(deviceOwnerIds.get(id) || "")) return;
+      const info = deviceRegistry.get(id) || {
+        manufacturer: "Unknown",
+        model: "Device",
+        androidVersion: "?",
+        sdkInt: 0,
+      };
+      devices.push({ id, ...info });
+    });
+    dash.send(JSON.stringify({ type: "DEVICE_UPDATE", devices }));
   });
 }
 
 // Active heartbeat to prune dead sockets every 10 seconds
 const pingInterval = setInterval(() => {
+  for (const [code, pending] of pendingPairings) {
+    if (pending.expiresAt <= Date.now()) {
+      pendingPairings.delete(code);
+      if (pending.socket.readyState === WebSocket.OPEN && pending.socket.clientType === "PENDING_PHONE") {
+        issuePairingCode(pending.socket);
+      }
+    }
+  }
   wss.clients.forEach((ws) => {
     const extWs = ws as ExtWebSocket;
+    if (extWs.clientType === "DASHBOARD" && (extWs.authExpiresAt || 0) <= Date.now()) {
+      extWs.terminate();
+      return;
+    }
     if (extWs.isAlive === false) {
       if (extWs.deviceId && connectedDevices.get(extWs.deviceId) === extWs) {
         connectedDevices.delete(extWs.deviceId);
@@ -454,23 +797,101 @@ wss.on("connection", (socket: WebSocket) => {
     extWs.isAlive = true;
   });
 
-  extWs.on("message", (data) => {
+  extWs.on("message", async (data) => {
     extWs.isAlive = true;
 
     try {
       const parsed = JSON.parse(data.toString());
 
-      if (parsed.type === "REGISTER_DASHBOARD") {
+      if (parsed.type === "DASHBOARD_AUTH") {
+        const accessToken = String(parsed.accessToken || "");
+        const userId = await authenticateSupabaseUser(accessToken);
+        if (!userId) {
+          extWs.send(JSON.stringify({ type: "AUTH_ERROR", message: "Your sign-in expired or could not be verified. Please sign in again." }));
+          extWs.close(1008, "Dashboard authentication failed");
+          return;
+        }
+        let workspaceIds: string[];
+        try {
+          workspaceIds = await getUserWorkspaceIds(userId);
+        } catch (error) {
+          console.error("Workspace lookup failed:", error);
+          workspaceIds = [];
+        }
+        if (workspaceIds.length === 0) {
+          extWs.send(JSON.stringify({ type: "AUTH_ERROR", message: "Your PhoneBridge workspace is not ready. Apply the database setup, then sign in again." }));
+          extWs.close(1011, "Account workspace unavailable");
+          return;
+        }
+        if (extWs.clientType && extWs.clientType !== "DASHBOARD") {
+          extWs.close(1008, "Connection already registered");
+          return;
+        }
+        if (extWs.userId && extWs.userId !== userId) {
+          extWs.close(1008, "Account changed; reconnect to continue");
+          return;
+        }
+        const expiresAt = getVerifiedTokenExpiry(accessToken);
+        if (!expiresAt || expiresAt <= Date.now()) {
+          extWs.send(JSON.stringify({ type: "AUTH_ERROR", message: "Your sign-in token has expired. Please sign in again." }));
+          extWs.close(1008, "Expired dashboard token");
+          return;
+        }
         extWs.clientType = "DASHBOARD";
+        extWs.userId = userId;
+        extWs.workspaceIds = workspaceIds;
+        extWs.authExpiresAt = expiresAt;
         dashboardSockets.add(extWs);
-        console.log("[Deck] Browser dashboard connected.");
+        extWs.send(JSON.stringify({ type: "DASHBOARD_AUTHENTICATED" }));
+        console.log("[Deck] Authenticated dashboard connected.");
         pushDeviceListUpdate();
         return;
       }
 
+      if (extWs.clientType === "DASHBOARD" && (!extWs.userId || (extWs.authExpiresAt || 0) <= Date.now())) {
+        extWs.close(1008, "Dashboard sign-in expired");
+        return;
+      }
+
+      if (parsed.type === "REGISTER_DEVICE") {
+        await registerPhone(extWs, parsed);
+        return;
+      }
+
+      if (extWs.clientType === "PENDING_PHONE") return;
+
+      if (extWs.clientType === "DASHBOARD" && parsed.type === "PAIR_DEVICE") {
+        const now = Date.now();
+        let attemptWindow = pairingAttemptsByUser.get(extWs.userId || "");
+        if (!attemptWindow || now - attemptWindow.windowStartedAt > 60_000) {
+          attemptWindow = { count: 0, windowStartedAt: now };
+        }
+        attemptWindow.count += 1;
+        pairingAttemptsByUser.set(extWs.userId || "", attemptWindow);
+        if (attemptWindow.count > 10) {
+          extWs.send(JSON.stringify({ type: "PAIR_RESULT", ok: false, message: "Too many attempts. Wait one minute, then try again." }));
+          return;
+        }
+        const code = String(parsed.code || "").trim();
+        if (!/^\d{6}$/.test(code)) {
+          extWs.send(JSON.stringify({ type: "PAIR_RESULT", ok: false, message: "Enter a valid 6-digit pairing code." }));
+          return;
+        }
+        await pairPendingDevice(extWs, code);
+        return;
+      }
+
       if (parsed.type === "DASHBOARD_COMMAND") {
+        if (extWs.clientType !== "DASHBOARD" || !extWs.userId || (extWs.authExpiresAt || 0) <= Date.now()) {
+          extWs.close(1008, "Dashboard sign-in required");
+          return;
+        }
         const targetId = parsed.deviceId;
         const command = parsed.command;
+        if (typeof targetId !== "string" || !extWs.workspaceIds?.includes(deviceOwnerIds.get(targetId) || "")) {
+          extWs.send(JSON.stringify({ type: "ACTIVITY", message: "That phone is not paired to your account." }));
+          return;
+        }
         const targetSocket = connectedDevices.get(targetId);
 
         if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
@@ -479,6 +900,7 @@ wss.on("connection", (socket: WebSocket) => {
           pushDeviceListUpdate();
           broadcastToDashboards({
             type: "ACTIVITY",
+            deviceId: targetId,
             message: `Command failed: Device ${targetId.slice(0, 8)} is offline.`,
           });
           return;
@@ -502,33 +924,7 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
-      if (parsed.type === "REGISTER_DEVICE") {
-        extWs.clientType = "PHONE";
-        const devId = parsed.deviceId;
-        if (!devId) return;
-
-        extWs.deviceId = devId;
-
-        // If an old socket for this device exists, terminate the ghost instance
-        const oldSocket = connectedDevices.get(devId);
-        if (oldSocket && oldSocket !== extWs) {
-          oldSocket.terminate();
-        }
-
-        connectedDevices.set(devId, extWs);
-        console.log(`Device registered: ${devId}`);
-
-        extWs.send(JSON.stringify({ type: "REGISTRATION_SUCCESS", deviceId: devId }));
-        extWs.send(JSON.stringify({ type: "COMMAND", command: "GET_DEVICE_INFO" }));
-        extWs.send(JSON.stringify({ type: "COMMAND", command: "GET_BATTERY" }));
-
-        pushDeviceListUpdate();
-        broadcastToDashboards({
-          type: "ACTIVITY",
-          message: `Device connected: ${devId.slice(0, 8)}...`,
-        });
-        return;
-      }
+      if (extWs.clientType !== "PHONE" || !extWs.deviceId) return;
 
       if (parsed.type === "DEVICE_INFO" && extWs.deviceId) {
         const devId = extWs.deviceId;
@@ -588,6 +984,7 @@ wss.on("connection", (socket: WebSocket) => {
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Telemetry synced from ${devId.slice(0, 8)}: ${parsed.networkType}, RAM: ${parsed.usedRamMb}/${parsed.totalRamMb}MB`,
         });
         return;
@@ -614,6 +1011,7 @@ wss.on("connection", (socket: WebSocket) => {
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Location received from ${devId.slice(0, 8)}: ${parsed.latitude.toFixed(4)}, ${parsed.longitude.toFixed(4)}`,
         });
         return;
@@ -685,6 +1083,7 @@ wss.on("connection", (socket: WebSocket) => {
 
           broadcastToDashboards({
             type: "ACTIVITY",
+            deviceId: devId,
             message: `Photo captured via ${lensFacing} by ${devId.slice(0, 8)}`,
           });
         }
@@ -712,6 +1111,7 @@ wss.on("connection", (socket: WebSocket) => {
 
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Screen capture ${parsed.active ? "started" : "stopped"} on ${devId.slice(0, 8)}`,
         });
         return;
@@ -757,6 +1157,7 @@ wss.on("connection", (socket: WebSocket) => {
 
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Screen capture completed on ${devId.slice(0, 8)} (${total} frame${total === 1 ? "" : "s"})`,
         });
         return;
@@ -774,6 +1175,7 @@ wss.on("connection", (socket: WebSocket) => {
 
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Screen capture error from ${devId.slice(0, 8)}: ${error}`,
         });
         return;
@@ -782,6 +1184,7 @@ wss.on("connection", (socket: WebSocket) => {
       if (parsed.type === "CAMERA_ERROR" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: extWs.deviceId,
           message: `Camera error from ${extWs.deviceId.slice(0, 8)}: ${parsed.error}`,
         });
         return;
@@ -790,6 +1193,7 @@ wss.on("connection", (socket: WebSocket) => {
       if (parsed.type === "LOCATION_ERROR" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: extWs.deviceId,
           message: `Location failed for ${extWs.deviceId.slice(0, 8)}: ${parsed.error}`,
         });
         return;
@@ -798,6 +1202,7 @@ wss.on("connection", (socket: WebSocket) => {
       if (parsed.type === "COMMAND_ACK" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: extWs.deviceId,
           message: `Device ${extWs.deviceId.slice(0, 8)} completed ${parsed.command} (${parsed.status})`,
         });
         return;
@@ -806,6 +1211,7 @@ wss.on("connection", (socket: WebSocket) => {
       if (parsed.type === "PONG" && extWs.deviceId) {
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: extWs.deviceId,
           message: `Pong received from ${extWs.deviceId.slice(0, 8)} - Online`,
         });
         return;
@@ -816,6 +1222,7 @@ wss.on("connection", (socket: WebSocket) => {
   });
 
   socket.on("close", () => {
+    if (extWs.pairingCode) pendingPairings.delete(extWs.pairingCode);
     if (extWs.clientType === "DASHBOARD") {
       dashboardSockets.delete(extWs);
       console.log("[Deck] Browser dashboard disconnected.");
@@ -828,6 +1235,7 @@ wss.on("connection", (socket: WebSocket) => {
         pushDeviceListUpdate();
         broadcastToDashboards({
           type: "ACTIVITY",
+          deviceId: devId,
           message: `Device disconnected: ${devId.slice(0, 8)}...`,
         });
       }
