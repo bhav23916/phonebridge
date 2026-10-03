@@ -1,5 +1,5 @@
 import http from "http";
-import { createHash, randomInt } from "crypto";
+import { createHash, createSign, randomInt } from "crypto";
 import { WebSocketServer, WebSocket } from "ws";
 
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
@@ -15,6 +15,7 @@ interface DeviceLocation {
 
 interface DeviceTelemetry {
   networkType: string;
+  internetAvailable?: boolean;
   wifiSSID: string;
   totalRamMb: number;
   availRamMb: number;
@@ -36,6 +37,11 @@ interface DeviceInfo {
   telemetry?: DeviceTelemetry;
   lastCapturedPhoto?: string;
   screenCaptureActive?: boolean;
+  online?: boolean;
+  lastSeenAt?: string | null;
+  lastNetworkType?: string | null;
+  lastNetworkAt?: string | null;
+  lastInternetAvailable?: boolean | null;
   lastCapturedScreen?: string;
   notifications?: Array<Record<string, unknown>>;
 }
@@ -49,11 +55,15 @@ interface ExtWebSocket extends WebSocket {
   authExpiresAt?: number;
   deviceTokenHash?: string;
   pairingCode?: string;
+  pendingFcmToken?: string;
 }
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || "";
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
+const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
+let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
+const wakeSentAt = new Map<string, number>();
 
 const DASHBOARD_HTML = `<!DOCTYPE html>
 <html lang="en">
@@ -71,6 +81,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
     .card h2 { margin: 0 0 8px 0; font-size: 18px; color: #f1f5f9; }
     .device-meta { font-size: 13px; color: #94a3b8; margin-bottom: 14px; line-height: 1.5; }
+    .connection-state { display: inline-flex; align-items: center; gap: 7px; margin: 2px 0 8px; padding: 5px 9px; border-radius: 999px; font-size: 12px; font-weight: 650; background: #102b21; color: #86efac; border: 1px solid #166534; }
+    .connection-state.offline { background: #321c20; color: #fca5a5; border-color: #7f1d1d; }
+    .connection-state.waking { background: #302814; color: #fde68a; border-color: #854d0e; }
+    .last-seen { margin: 0 0 8px; color: #94a3b8; font-size: 12px; }
     .meta-tag { font-family: monospace; font-size: 11px; background: #0f172a; padding: 2px 6px; border-radius: 4px; }
     
     .telemetry-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 10px; }
@@ -212,6 +226,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
     const notificationsByDevice = new Map();
+    const wakeStateByDevice = new Map();
+    const wakeTimers = new Map();
+    let lastDeviceSnapshot = [];
 
     function logEvent(text) {
       const line = document.createElement("div");
@@ -385,7 +402,32 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         document.getElementById("pairStatus").textContent = msg.message || (msg.ok ? "Phone paired." : "Pairing failed.");
         if (msg.ok) document.getElementById("pairCode").value = "";
       } else if (msg.type === "DEVICE_UPDATE") {
+        for (const device of (msg.devices || [])) {
+          if (device.online) {
+            wakeStateByDevice.delete(device.id);
+            clearTimeout(wakeTimers.get(device.id));
+            wakeTimers.delete(device.id);
+          }
+        }
         renderDevices(msg.devices);
+      } else if (msg.type === "WAKE_STATUS") {
+        clearTimeout(wakeTimers.get(msg.deviceId));
+        if (msg.status === "sent") {
+          wakeStateByDevice.set(msg.deviceId, "waking");
+          wakeTimers.set(msg.deviceId, setTimeout(() => {
+            if (wakeStateByDevice.get(msg.deviceId) === "waking") {
+              wakeStateByDevice.set(msg.deviceId, "timeout");
+              logEvent("No wake response yet from " + msg.deviceId.slice(0, 8) + ". The request may still arrive when the phone reconnects.");
+              renderDevices(lastDeviceSnapshot);
+            }
+          }, 45000));
+        } else if (msg.status === "online") {
+          wakeStateByDevice.delete(msg.deviceId);
+        } else {
+          wakeStateByDevice.set(msg.deviceId, "failed");
+        }
+        if (msg.message) logEvent(msg.message);
+        renderDevices(lastDeviceSnapshot);
       } else if (msg.type === "ACTIVITY") {
         // Screenshot status, completion, and error events are also
         // delivered with dedicated message types below. Avoid logging
@@ -460,9 +502,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       logEvent("Dispatched " + command + " to " + deviceId.slice(0, 8) + "...");
     }
 
+    function wakeDevice(deviceId) {
+      wakeStateByDevice.set(deviceId, "sending");
+      renderDevices(lastDeviceSnapshot);
+      sendCommand(deviceId, "WAKE_DEVICE");
+    }
+
     function renderDevices(devices) {
+      lastDeviceSnapshot = Array.isArray(devices) ? devices : [];
       if (devices.length === 0) {
-        deviceListEl.innerHTML = '<div style="color: #64748b; font-size: 14px;">No phones connected.</div>';
+        deviceListEl.innerHTML = '<div style="color: #64748b; font-size: 14px;">No phones paired yet.</div>';
         return;
       }
 
@@ -475,6 +524,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           : "Unknown";
 
         const t = d.telemetry;
+        const wakeState = wakeStateByDevice.get(d.id);
+        const isOnline = Boolean(d.online);
+        const internetText = isOnline
+          ? (t && typeof t.internetAvailable === "boolean" ? (t.internetAvailable ? "Internet available" : "No internet connection") : "Network reachable")
+          : (typeof d.lastInternetAvailable === "boolean" ? (d.lastInternetAvailable ? "Last reported: internet available" : "Last reported: no internet") : "Current network state unavailable");
+        const connectionText = isOnline ? "Online" : wakeState === "waking" || wakeState === "sending" ? "Waking…" : wakeState === "timeout" ? "No response" : "Offline / not reachable";
+        const connectionClass = isOnline ? "" : wakeState === "waking" || wakeState === "sending" ? "waking" : "offline";
+        const lastSeenText = d.lastSeenAt ? "Last seen " + new Date(d.lastSeenAt).toLocaleString() : "Not connected yet";
+        const networkLabel = d.lastNetworkType ? "Last reported network: " + d.lastNetworkType : "";
         const latitude = Number(d.location && d.location.latitude);
         const longitude = Number(d.location && d.location.longitude);
         const accuracy = Number(d.location && d.location.accuracy);
@@ -511,6 +569,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
           <div class="card">
             <h2>\${escapeHtml(d.manufacturer || "Android")} \${escapeHtml(d.model || "Device")}</h2>
             <div class="device-meta">
+              <div class="connection-state \${connectionClass}">\${escapeHtml(connectionText)}</div>
+              <div class="last-seen">\${escapeHtml(lastSeenText)}\${networkLabel ? " · " + escapeHtml(networkLabel) : ""}</div>
+              <div class="last-seen">\${escapeHtml(internetText)}\${d.lastNetworkAt ? " · reported " + escapeHtml(new Date(d.lastNetworkAt).toLocaleString()) : ""}</div>
               <div>OS: Android \${escapeHtml(d.androidVersion || "?")} (SDK \${escapeHtml(d.sdkInt || "?")})</div>
               <div>Battery: \${escapeHtml(batteryStr)}</div>
               <div style="margin-top: 4px;">ID: <span class="meta-tag">\${escapeHtml(d.id)}</span></div>
@@ -521,6 +582,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               </div>
             </div>
             <div class="actions">
+              \${isOnline ? "" : "<button class=\\\"tele\\\" onclick=\\\"wakeDevice('" + d.id + "')\\\">Wake phone</button>"}
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_BACK')">📸 Back Cam</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_FRONT')">🤳 Front Cam</button>
               <button class="tele" onclick="sendCommand('\${d.id}', 'GET_TELEMETRY')">Sync Telemetry</button>
@@ -644,6 +706,195 @@ async function getPairedDevice(deviceId: string): Promise<{ workspaceId: string;
   return row ? { workspaceId: row.workspace_id, tokenHash: row.device_token_hash } : null;
 }
 
+type PairedDeviceRow = {
+  device_id: string;
+  workspace_id: string;
+  last_seen_at: string | null;
+  last_network_type: string | null;
+  last_network_at: string | null;
+  last_internet_available: boolean | null;
+};
+
+async function getWorkspaceDevices(workspaceIds: string[]): Promise<PairedDeviceRow[]> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY || workspaceIds.length === 0) return [];
+  const url = new URL(`${SUPABASE_URL}/rest/v1/phonebridge_devices`);
+  url.searchParams.set("workspace_id", `in.(${workspaceIds.join(",")})`);
+  url.searchParams.set("select", "device_id,workspace_id,last_seen_at,last_network_type,last_network_at,last_internet_available");
+  url.searchParams.set("order", "created_at.desc");
+  url.searchParams.set("limit", "200");
+  const response = await fetch(url, {
+    headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}` },
+  });
+  if (!response.ok) {
+    console.error("Could not list paired devices:", response.status, await response.text());
+    return [];
+  }
+  return await response.json() as PairedDeviceRow[];
+}
+
+async function updateDevicePresence(
+  deviceId: string,
+  networkType?: string,
+  internetAvailable?: boolean,
+): Promise<void> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return;
+  const body: Record<string, unknown> = { last_seen_at: new Date().toISOString() };
+  if (networkType !== undefined) body.last_network_type = networkType;
+  if (internetAvailable !== undefined) body.last_internet_available = internetAvailable;
+  if (networkType !== undefined || internetAvailable !== undefined) body.last_network_at = new Date().toISOString();
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/phonebridge_devices?device_id=eq.${encodeURIComponent(deviceId)}`, {
+    method: "PATCH",
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal",
+    },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) console.error("Could not update device presence:", response.status, await response.text());
+}
+
+async function saveDevicePushToken(deviceId: string, token: string): Promise<void> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY || !token) return;
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/phonebridge_device_push_tokens?on_conflict=device_id`, {
+    method: "POST",
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      "Content-Type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=minimal",
+    },
+    body: JSON.stringify({ device_id: deviceId, fcm_token: token, updated_at: new Date().toISOString() }),
+  });
+  if (!response.ok) console.error("Could not save device push token:", response.status, await response.text());
+}
+
+async function getDevicePushToken(deviceId: string): Promise<string | null> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return null;
+  const url = new URL(`${SUPABASE_URL}/rest/v1/phonebridge_device_push_tokens`);
+  url.searchParams.set("device_id", `eq.${deviceId}`);
+  url.searchParams.set("select", "fcm_token");
+  url.searchParams.set("limit", "1");
+  const response = await fetch(url, {
+    headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}` },
+  });
+  if (!response.ok) {
+    console.error("Could not load device push token:", response.status, await response.text());
+    return null;
+  }
+  const rows = await response.json() as Array<{ fcm_token: string }>;
+  return rows[0]?.fcm_token || null;
+}
+
+function base64Url(value: string | Buffer): string {
+  return Buffer.from(value).toString("base64url");
+}
+
+async function getFirebaseAccessToken(): Promise<{ token: string; projectId: string } | null> {
+  if (!FIREBASE_SERVICE_ACCOUNT_JSON) return null;
+  if (firebaseAccessToken && firebaseAccessToken.expiresAt > Date.now() + 60_000) {
+    try {
+      const account = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON) as { project_id?: string };
+      if (account.project_id) return { token: firebaseAccessToken.value, projectId: account.project_id };
+    } catch { return null; }
+  }
+  try {
+    const account = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON) as {
+      client_email?: string; private_key?: string; token_uri?: string; project_id?: string;
+    };
+    if (!account.client_email || !account.private_key || !account.project_id) return null;
+    const tokenUri = account.token_uri || "https://oauth2.googleapis.com/token";
+    const now = Math.floor(Date.now() / 1000);
+    const unsigned = `${base64Url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${base64Url(JSON.stringify({
+      iss: account.client_email,
+      scope: "https://www.googleapis.com/auth/firebase.messaging",
+      aud: tokenUri,
+      iat: now,
+      exp: now + 3600,
+    }))}`;
+    const signer = createSign("RSA-SHA256");
+    signer.update(unsigned);
+    const assertion = `${unsigned}.${signer.sign(account.private_key, "base64url")}`;
+    const response = await fetch(tokenUri, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion,
+      }),
+    });
+    const payload = await response.json() as { access_token?: string; expires_in?: number; error?: string };
+    if (!response.ok || !payload.access_token) {
+      console.error("Firebase OAuth token request failed:", response.status, payload.error || "no access token");
+      return null;
+    }
+    firebaseAccessToken = { value: payload.access_token, expiresAt: Date.now() + (payload.expires_in || 3600) * 1000 };
+    return { token: payload.access_token, projectId: account.project_id };
+  } catch (error) {
+    console.error("Firebase service account configuration is invalid:", error);
+    return null;
+  }
+}
+
+async function sendWakePush(deviceId: string, token: string): Promise<{ ok: boolean; reason?: string }> {
+  const credentials = await getFirebaseAccessToken();
+  if (!credentials) return { ok: false, reason: "Firebase server credentials are not configured." };
+  try {
+    const response = await fetch(`https://fcm.googleapis.com/v1/projects/${encodeURIComponent(credentials.projectId)}/messages:send`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${credentials.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ message: {
+        token,
+        data: { type: "WAKE", deviceId },
+        android: { priority: "HIGH", ttl: "86400s" },
+      } }),
+    });
+    if (response.ok) return { ok: true };
+    const errorText = await response.text();
+    console.error("FCM wake send failed:", response.status, errorText);
+    if (response.status === 404 || errorText.includes("UNREGISTERED")) {
+      return { ok: false, reason: "The saved phone push token has expired. Open PhoneBridge on that phone once to refresh it." };
+    }
+    return { ok: false, reason: `Firebase could not send the wake request (HTTP ${response.status}).` };
+  } catch (error) {
+    console.error("FCM wake request failed:", error);
+    return { ok: false, reason: "Could not contact Firebase Cloud Messaging." };
+  }
+}
+
+async function wakeOfflineDevicesForDashboard(dashboard: ExtWebSocket): Promise<void> {
+  if (!dashboard.workspaceIds?.length || dashboard.readyState !== WebSocket.OPEN) return;
+  let rows: PairedDeviceRow[];
+  try {
+    rows = await getWorkspaceDevices(dashboard.workspaceIds);
+  } catch (error) {
+    console.error("Could not load paired devices for automatic wake:", error);
+    return;
+  }
+  for (const row of rows) {
+    deviceOwnerIds.set(row.device_id, row.workspace_id);
+    if (connectedDevices.get(row.device_id)?.readyState === WebSocket.OPEN) continue;
+    const now = Date.now();
+    if (now - (wakeSentAt.get(row.device_id) || 0) < 60_000) continue;
+    wakeSentAt.set(row.device_id, now);
+    const token = await getDevicePushToken(row.device_id);
+    if (!token) {
+      dashboard.send(JSON.stringify({
+        type: "WAKE_STATUS", deviceId: row.device_id, status: "unavailable",
+        message: `No wake token for ${row.device_id.slice(0, 8)} yet. Open PhoneBridge on that phone with internet once.`,
+      }));
+      continue;
+    }
+    const result = await sendWakePush(row.device_id, token);
+    dashboard.send(JSON.stringify({
+      type: "WAKE_STATUS", deviceId: row.device_id,
+      status: result.ok ? "sent" : "failed",
+      message: result.ok ? `Wake request sent to ${row.device_id.slice(0, 8)}; waiting for it to reconnect…` : result.reason,
+    }));
+  }
+}
+
 async function saveDevicePairing(deviceId: string, workspaceId: string, pairedBy: string, tokenHash: string): Promise<boolean> {
   if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return false;
   const response = await fetch(`${SUPABASE_URL}/rest/v1/phonebridge_devices`, {
@@ -682,6 +933,8 @@ function registerPairedDevice(socket: ExtWebSocket, deviceId: string, workspaceI
   const previous = connectedDevices.get(deviceId);
   if (previous && previous !== socket) previous.terminate();
   connectedDevices.set(deviceId, socket);
+  void updateDevicePresence(deviceId);
+  if (socket.pendingFcmToken) void saveDevicePushToken(deviceId, socket.pendingFcmToken);
   if (!deviceRegistry.has(deviceId)) {
     deviceRegistry.set(deviceId, {
       manufacturer: "Unknown",
@@ -705,6 +958,8 @@ function registerPairedDevice(socket: ExtWebSocket, deviceId: string, workspaceI
 async function registerPhone(socket: ExtWebSocket, message: Record<string, unknown>) {
   const deviceId = typeof message.deviceId === "string" ? message.deviceId : "";
   const deviceToken = typeof message.deviceToken === "string" ? message.deviceToken : "";
+  const fcmToken = typeof message.fcmToken === "string" ? message.fcmToken : "";
+  if (fcmToken.length > 0 && fcmToken.length <= 500) socket.pendingFcmToken = fcmToken;
   if (!/^[0-9a-fA-F-]{36}$/.test(deviceId) || deviceToken.length < 32 || deviceToken.length > 256) {
     socket.close(1008, "Invalid device credentials");
     return;
@@ -763,6 +1018,7 @@ async function pairPendingDevice(dashboard: ExtWebSocket, code: string) {
   phone.pairingCode = undefined;
   dashboard.send(JSON.stringify({ type: "PAIR_RESULT", ok: true, message: "Phone paired to your account." }));
   registerPairedDevice(phone, deviceId, workspaceId);
+  if (phone.pendingFcmToken) await saveDevicePushToken(deviceId, phone.pendingFcmToken);
 }
 
 function broadcastToDashboards(messageObj: object) {
@@ -777,20 +1033,34 @@ function broadcastToDashboards(messageObj: object) {
 }
 
 function pushDeviceListUpdate() {
-  dashboardSockets.forEach((dash) => {
+  dashboardSockets.forEach(async (dash) => {
     if (!dash.userId || dash.readyState !== WebSocket.OPEN || (dash.authExpiresAt || 0) <= Date.now()) return;
-    const devices: Array<{ id: string } & Partial<DeviceInfo>> = [];
-    connectedDevices.forEach((_, id) => {
-      if (!dash.workspaceIds?.includes(deviceOwnerIds.get(id) || "")) return;
-      const info = deviceRegistry.get(id) || {
-        manufacturer: "Unknown",
-        model: "Device",
-        androidVersion: "?",
-        sdkInt: 0,
-      };
-      devices.push({ id, ...info });
-    });
-    dash.send(JSON.stringify({ type: "DEVICE_UPDATE", devices }));
+    try {
+      const pairedRows = await getWorkspaceDevices(dash.workspaceIds || []);
+      if (dash.readyState !== WebSocket.OPEN) return;
+      const devices: Array<{ id: string } & Partial<DeviceInfo>> = pairedRows.map((row) => {
+        deviceOwnerIds.set(row.device_id, row.workspace_id);
+        const info = deviceRegistry.get(row.device_id) || {
+          manufacturer: "Unknown",
+          model: "Device",
+          androidVersion: "?",
+          sdkInt: 0,
+        };
+        const online = connectedDevices.get(row.device_id)?.readyState === WebSocket.OPEN;
+        return {
+          id: row.device_id,
+          ...info,
+          online,
+          lastSeenAt: online ? new Date().toISOString() : row.last_seen_at,
+          lastNetworkType: row.last_network_type,
+          lastNetworkAt: row.last_network_at,
+          lastInternetAvailable: row.last_internet_available,
+        };
+      });
+      dash.send(JSON.stringify({ type: "DEVICE_UPDATE", devices }));
+    } catch (error) {
+      console.error("Could not refresh dashboard device list:", error);
+    }
   });
 }
 
@@ -813,7 +1083,6 @@ const pingInterval = setInterval(() => {
     if (extWs.isAlive === false) {
       if (extWs.deviceId && connectedDevices.get(extWs.deviceId) === extWs) {
         connectedDevices.delete(extWs.deviceId);
-        deviceRegistry.delete(extWs.deviceId);
         console.log(`[Heartbeat] Removed unresponsive device: ${extWs.deviceId}`);
         pushDeviceListUpdate();
       }
@@ -885,6 +1154,7 @@ wss.on("connection", (socket: WebSocket) => {
         extWs.send(JSON.stringify({ type: "DASHBOARD_AUTHENTICATED" }));
         console.log("[Deck] Authenticated dashboard connected.");
         pushDeviceListUpdate();
+        void wakeOfflineDevicesForDashboard(extWs);
         return;
       }
 
@@ -895,6 +1165,16 @@ wss.on("connection", (socket: WebSocket) => {
 
       if (parsed.type === "REGISTER_DEVICE") {
         await registerPhone(extWs, parsed);
+        return;
+      }
+
+      if (parsed.type === "PUSH_TOKEN") {
+        const token = typeof parsed.token === "string" ? parsed.token : "";
+        if (token.length < 20 || token.length > 500 || extWs.clientType === "DASHBOARD") return;
+        extWs.pendingFcmToken = token;
+        if (extWs.clientType === "PHONE" && extWs.deviceId) {
+          await saveDevicePushToken(extWs.deviceId, token);
+        }
         return;
       }
 
@@ -934,9 +1214,36 @@ wss.on("connection", (socket: WebSocket) => {
         }
         const targetSocket = connectedDevices.get(targetId);
 
+        if (command === "WAKE_DEVICE") {
+          if (targetSocket?.readyState === WebSocket.OPEN) {
+            extWs.send(JSON.stringify({ type: "WAKE_STATUS", deviceId: targetId, status: "online" }));
+            return;
+          }
+          const pushToken = await getDevicePushToken(targetId);
+          if (!pushToken) {
+            extWs.send(JSON.stringify({
+              type: "WAKE_STATUS",
+              deviceId: targetId,
+              status: "unavailable",
+              message: "No wake token is registered yet. Open PhoneBridge on the phone with internet once, then try again.",
+            }));
+            return;
+          }
+          const result = await sendWakePush(targetId, pushToken);
+          extWs.send(JSON.stringify({
+            type: "WAKE_STATUS",
+            deviceId: targetId,
+            status: result.ok ? "sent" : "failed",
+            message: result.ok ? "Wake request sent. Waiting for the phone to reconnect…" : result.reason,
+          }));
+          if (result.ok) {
+            broadcastToDashboards({ type: "ACTIVITY", deviceId: targetId, message: `Wake request sent to ${targetId.slice(0, 8)}; waiting for the phone.` });
+          }
+          return;
+        }
+
         if (!targetSocket || targetSocket.readyState !== WebSocket.OPEN) {
           connectedDevices.delete(targetId);
-          deviceRegistry.delete(targetId);
           pushDeviceListUpdate();
           broadcastToDashboards({
             type: "ACTIVITY",
@@ -1010,6 +1317,7 @@ wss.on("connection", (socket: WebSocket) => {
         };
         current.telemetry = {
           networkType: parsed.networkType,
+          internetAvailable: typeof parsed.internetAvailable === "boolean" ? parsed.internetAvailable : undefined,
           wifiSSID: parsed.wifiSSID,
           totalRamMb: parsed.totalRamMb,
           availRamMb: parsed.availRamMb,
@@ -1020,6 +1328,11 @@ wss.on("connection", (socket: WebSocket) => {
           isScreenOn: parsed.isScreenOn,
         };
         deviceRegistry.set(devId, current);
+        void updateDevicePresence(
+          devId,
+          typeof parsed.networkType === "string" ? parsed.networkType : undefined,
+          typeof parsed.internetAvailable === "boolean" ? parsed.internetAvailable : undefined,
+        );
 
         pushDeviceListUpdate();
         broadcastToDashboards({
@@ -1270,7 +1583,6 @@ wss.on("connection", (socket: WebSocket) => {
       const devId = extWs.deviceId;
       if (connectedDevices.get(devId) === extWs) {
         connectedDevices.delete(devId);
-        deviceRegistry.delete(devId);
         console.log(`Device disconnected: ${devId}`);
         pushDeviceListUpdate();
         broadcastToDashboards({
