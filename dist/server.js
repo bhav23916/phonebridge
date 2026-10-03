@@ -362,6 +362,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       if (msg.type === "DASHBOARD_AUTHENTICATED") {
         dashboardAuthenticated = true;
+        document.getElementById("authLoading").style.display = "none";
         document.getElementById("authPanel").style.display = "none";
         document.getElementById("dashboardContent").style.display = "block";
         document.getElementById("accountActions").style.display = "flex";
