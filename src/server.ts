@@ -157,7 +157,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     </div>
   </header>
 
-  <section class="auth-shell" id="authPanel">
+  <section class="auth-shell" id="authLoading" aria-live="polite">
+    <div class="auth-intro"><div class="brand-mark" aria-hidden="true">PB</div><div><h2>Welcome back.</h2><p>Restoring your secure PhoneBridge session…</p></div><div class="intro-foot">PRIVATE DEVICE DASHBOARD&nbsp; · &nbsp;SECURE SIGN-IN</div></div>
+    <div class="auth-panel"><h3>Loading your workspace</h3><p id="authLoadingMessage">Checking your saved sign-in…</p></div>
+  </section>
+  <section class="auth-shell" id="authPanel" style="display:none">
     <div class="auth-intro">
       <div class="brand-mark" aria-hidden="true">PB</div>
       <div>
@@ -222,6 +226,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     let ws = null;
     let currentSession = null;
     let dashboardAuthenticated = false;
+    let authInitialized = false;
+    let authConnectionToken = "";
+    const wakeRequestById = new Map();
     const deviceListEl = document.getElementById("deviceList");
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
@@ -311,6 +318,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       document.getElementById("authError").textContent = message || "";
     }
 
+    function showAuthLoading(message) {
+      document.getElementById("authLoadingMessage").textContent = message || "Checking your saved sign-in…";
+      document.getElementById("authLoading").style.display = "grid";
+      document.getElementById("authPanel").style.display = "none";
+      document.getElementById("dashboardContent").style.display = "none";
+      document.getElementById("accountActions").style.display = "none";
+    }
+
+    function showSignIn() {
+      document.getElementById("authLoading").style.display = "none";
+      document.getElementById("authPanel").style.display = "grid";
+      document.getElementById("dashboardContent").style.display = "none";
+      document.getElementById("accountActions").style.display = "none";
+    }
+
     async function signInWithGoogle() {
       const button = document.getElementById("googleSignIn");
       if (!supabaseClient) {
@@ -362,7 +384,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
 
     function connectDashboard(session) {
+      if (!session || !session.access_token) { showSignIn(); return; }
+      if (authConnectionToken === session.access_token && ws && ws.readyState <= WebSocket.OPEN) return;
+      authConnectionToken = session.access_token;
       currentSession = session;
+      showAuthLoading("Connecting securely to your PhoneBridge workspace…");
       if (ws) { try { ws.close(); } catch (_) {} }
       const socket = new WebSocket(protocol + window.location.host);
       ws = socket;
@@ -374,6 +400,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
       socket.onclose = () => {
         if (ws !== socket) return;
+        authConnectionToken = "";
         dashboardAuthenticated = false;
         deckStatusEl.textContent = "● Deck Offline";
         deckStatusEl.style.borderColor = "#ef4444";
@@ -397,13 +424,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         logEvent("Signed in and connected to PhoneBridge.");
       } else if (msg.type === "AUTH_ERROR") {
         setAuthError(msg.message || "Sign-in could not be verified by the server.");
+        authConnectionToken = "";
+        showSignIn();
         ws.close();
       } else if (msg.type === "PAIR_RESULT") {
         document.getElementById("pairStatus").textContent = msg.message || (msg.ok ? "Phone paired." : "Pairing failed.");
         if (msg.ok) document.getElementById("pairCode").value = "";
       } else if (msg.type === "DEVICE_UPDATE") {
         for (const device of (msg.devices || [])) {
-          if (device.online) {
+          if (device.online && wakeStateByDevice.get(device.id) !== "test-received") {
             wakeStateByDevice.delete(device.id);
             clearTimeout(wakeTimers.get(device.id));
             wakeTimers.delete(device.id);
@@ -413,9 +442,14 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       } else if (msg.type === "WAKE_STATUS") {
         clearTimeout(wakeTimers.get(msg.deviceId));
         if (msg.status === "sent") {
-          wakeStateByDevice.set(msg.deviceId, "waking");
+          wakeStateByDevice.set(msg.deviceId, msg.test ? "test-sent" : "waking");
           wakeTimers.set(msg.deviceId, setTimeout(() => {
-            if (wakeStateByDevice.get(msg.deviceId) === "waking") {
+            const state = wakeStateByDevice.get(msg.deviceId);
+            if (state === "test-sent") {
+              wakeStateByDevice.set(msg.deviceId, "test-timeout");
+              logEvent("Firebase accepted the test push, but the phone has not confirmed receipt within 45 seconds.");
+              renderDevices(lastDeviceSnapshot);
+            } else if (state === "waking") {
               wakeStateByDevice.set(msg.deviceId, "timeout");
               logEvent("No wake response yet from " + msg.deviceId.slice(0, 8) + ". The request may still arrive when the phone reconnects.");
               renderDevices(lastDeviceSnapshot);
@@ -428,6 +462,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         }
         if (msg.message) logEvent(msg.message);
         renderDevices(lastDeviceSnapshot);
+      } else if (msg.type === "WAKE_ACK") {
+        if (wakeRequestById.get(msg.deviceId) === msg.requestId) {
+          clearTimeout(wakeTimers.get(msg.deviceId));
+          wakeRequestById.delete(msg.deviceId);
+          wakeStateByDevice.set(msg.deviceId, "test-received");
+          logEvent("Wake test confirmed: this phone received the Firebase push.");
+          renderDevices(lastDeviceSnapshot);
+        }
+      } else if (msg.type === "DEVICE_FORGOTTEN") {
+        logEvent(msg.message || "Phone removed from your dashboard.");
+        pushDeviceListUpdate();
       } else if (msg.type === "ACTIVITY") {
         // Screenshot status, completion, and error events are also
         // delivered with dedicated message types below. Avoid logging
@@ -470,18 +515,29 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
 
     if (supabaseClient) {
+      showAuthLoading("Checking your saved sign-in…");
       supabaseClient.auth.onAuthStateChange((event, session) => {
+        if (!authInitialized && event === "INITIAL_SESSION") authInitialized = true;
+        if (!authInitialized) return;
         if (session) {
           setAuthError("");
           connectDashboard(session);
         } else {
+          authConnectionToken = "";
           currentSession = null;
           dashboardAuthenticated = false;
           if (ws) { ws.close(); ws = null; }
-          document.getElementById("authPanel").style.display = "block";
-          document.getElementById("dashboardContent").style.display = "none";
-          document.getElementById("accountActions").style.display = "none";
+          showSignIn();
         }
+      });
+      supabaseClient.auth.getSession().then(({ data, error }) => {
+        if (authInitialized) return;
+        authInitialized = true;
+        if (error) setAuthError("Could not restore your sign-in. Please sign in again.");
+        if (data.session) connectDashboard(data.session);
+        else showSignIn();
+      }).catch(() => {
+        if (!authInitialized) { authInitialized = true; showSignIn(); }
       });
     } else {
       setAuthError("Server Supabase configuration is missing.");
@@ -508,6 +564,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       sendCommand(deviceId, "WAKE_DEVICE");
     }
 
+    function testWake(deviceId) {
+      const requestId = crypto.randomUUID();
+      wakeRequestById.set(deviceId, requestId);
+      wakeStateByDevice.set(deviceId, "testing");
+      renderDevices(lastDeviceSnapshot);
+      sendCommand(deviceId, "TEST_WAKE", { requestId });
+    }
+
+    function forgetDevice(deviceId) {
+      if (!window.confirm("Remove this phone from your dashboard? It will need to be paired again to reconnect.")) return;
+      sendCommand(deviceId, "FORGET_DEVICE");
+    }
+
     function renderDevices(devices) {
       lastDeviceSnapshot = Array.isArray(devices) ? devices : [];
       if (devices.length === 0) {
@@ -529,8 +598,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         const internetText = isOnline
           ? (t && typeof t.internetAvailable === "boolean" ? (t.internetAvailable ? "Internet available" : "No internet connection") : "Network reachable")
           : (typeof d.lastInternetAvailable === "boolean" ? (d.lastInternetAvailable ? "Last reported: internet available" : "Last reported: no internet") : "Current network state unavailable");
-        const connectionText = isOnline ? "Online" : wakeState === "waking" || wakeState === "sending" ? "Waking…" : wakeState === "timeout" ? "No response" : "Offline / not reachable";
-        const connectionClass = isOnline ? "" : wakeState === "waking" || wakeState === "sending" ? "waking" : "offline";
+        const connectionText = isOnline ? "Online" : wakeState === "testing" ? "Testing push…" : wakeState === "test-sent" ? "Push sent · waiting for phone" : wakeState === "test-received" ? "Push received" : wakeState === "test-timeout" ? "Push not confirmed" : wakeState === "waking" || wakeState === "sending" ? "Waking…" : wakeState === "timeout" ? "No response" : "Offline / not reachable";
+        const connectionClass = isOnline ? "" : wakeState && wakeState.startsWith("test") ? "waking" : wakeState === "waking" || wakeState === "sending" ? "waking" : "offline";
         const lastSeenText = d.lastSeenAt ? "Last seen " + new Date(d.lastSeenAt).toLocaleString() : "Not connected yet";
         const networkLabel = d.lastNetworkType ? "Last reported network: " + d.lastNetworkType : "";
         const latitude = Number(d.location && d.location.latitude);
@@ -583,6 +652,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
             </div>
             <div class="actions">
               \${isOnline ? "" : "<button class=\\\"tele\\\" onclick=\\\"wakeDevice('" + d.id + "')\\\">Wake phone</button>"}
+              <button class="tele" onclick="testWake('\${d.id}')">Test wake</button>
+              <button class="torch-off" onclick="forgetDevice('\${d.id}')">Forget device</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_BACK')">📸 Back Cam</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_FRONT')">🤳 Front Cam</button>
               <button class="tele" onclick="sendCommand('\${d.id}', 'GET_TELEMETRY')">Sync Telemetry</button>
@@ -837,7 +908,7 @@ async function getFirebaseAccessToken(): Promise<{ token: string; projectId: str
   }
 }
 
-async function sendWakePush(deviceId: string, token: string): Promise<{ ok: boolean; reason?: string }> {
+async function sendWakePush(deviceId: string, token: string, requestId = ""): Promise<{ ok: boolean; reason?: string }> {
   const credentials = await getFirebaseAccessToken();
   if (!credentials) return { ok: false, reason: "Firebase server credentials are not configured." };
   try {
@@ -846,7 +917,7 @@ async function sendWakePush(deviceId: string, token: string): Promise<{ ok: bool
       headers: { Authorization: `Bearer ${credentials.token}`, "Content-Type": "application/json" },
       body: JSON.stringify({ message: {
         token,
-        data: { type: "WAKE", deviceId },
+        data: { type: "WAKE", deviceId, ...(requestId ? { requestId } : {}) },
         android: { priority: "HIGH", ttl: "86400s" },
       } }),
     });
@@ -914,6 +985,22 @@ async function saveDevicePairing(deviceId: string, workspaceId: string, pairedBy
   return true;
 }
 
+async function removeDevicePairing(deviceId: string, workspaceId: string): Promise<boolean> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return false;
+  const url = new URL(`${SUPABASE_URL}/rest/v1/phonebridge_devices`);
+  url.searchParams.set("device_id", `eq.${deviceId}`);
+  url.searchParams.set("workspace_id", `eq.${workspaceId}`);
+  const response = await fetch(url, {
+    method: "DELETE",
+    headers: { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}`, Prefer: "return=minimal" },
+  });
+  if (!response.ok) {
+    console.error("Could not remove paired device:", response.status, await response.text());
+    return false;
+  }
+  return true;
+}
+
 function issuePairingCode(socket: ExtWebSocket) {
   if (!socket.deviceId || !socket.deviceTokenHash || socket.readyState !== WebSocket.OPEN) return;
   if (socket.pairingCode) pendingPairings.delete(socket.pairingCode);
@@ -959,6 +1046,7 @@ async function registerPhone(socket: ExtWebSocket, message: Record<string, unkno
   const deviceId = typeof message.deviceId === "string" ? message.deviceId : "";
   const deviceToken = typeof message.deviceToken === "string" ? message.deviceToken : "";
   const fcmToken = typeof message.fcmToken === "string" ? message.fcmToken : "";
+  const wakeRequestId = typeof message.wakeRequestId === "string" && /^[0-9a-f-]{36}$/i.test(message.wakeRequestId) ? message.wakeRequestId : "";
   if (fcmToken.length > 0 && fcmToken.length <= 500) socket.pendingFcmToken = fcmToken;
   if (!/^[0-9a-fA-F-]{36}$/.test(deviceId) || deviceToken.length < 32 || deviceToken.length > 256) {
     socket.close(1008, "Invalid device credentials");
@@ -984,6 +1072,10 @@ async function registerPhone(socket: ExtWebSocket, message: Record<string, unkno
       return;
     }
     registerPairedDevice(socket, deviceId, pairedDevice.workspaceId);
+    if (wakeRequestId) {
+      socket.send(JSON.stringify({ type: "WAKE_ACK_CONFIRMED", requestId: wakeRequestId }));
+      broadcastToDashboards({ type: "WAKE_ACK", deviceId, requestId: wakeRequestId });
+    }
     return;
   }
 
@@ -1180,6 +1272,15 @@ wss.on("connection", (socket: WebSocket) => {
 
       if (extWs.clientType === "PENDING_PHONE") return;
 
+      if (extWs.clientType === "PHONE" && parsed.type === "WAKE_RECEIVED" && extWs.deviceId) {
+        const requestId = typeof parsed.requestId === "string" && /^[0-9a-f-]{36}$/i.test(parsed.requestId) ? parsed.requestId : "";
+        if (requestId) {
+          extWs.send(JSON.stringify({ type: "WAKE_ACK_CONFIRMED", requestId }));
+          broadcastToDashboards({ type: "WAKE_ACK", deviceId: extWs.deviceId, requestId });
+        }
+        return;
+      }
+
       if (extWs.clientType === "DASHBOARD" && parsed.type === "PAIR_DEVICE") {
         const now = Date.now();
         let attemptWindow = pairingAttemptsByUser.get(extWs.userId || "");
@@ -1214,9 +1315,33 @@ wss.on("connection", (socket: WebSocket) => {
         }
         const targetSocket = connectedDevices.get(targetId);
 
-        if (command === "WAKE_DEVICE") {
-          if (targetSocket?.readyState === WebSocket.OPEN) {
+        if (command === "FORGET_DEVICE") {
+          const workspaceId = deviceOwnerIds.get(targetId);
+          if (!workspaceId || !extWs.workspaceIds?.includes(workspaceId)) return;
+          const removed = await removeDevicePairing(targetId, workspaceId);
+          if (!removed) {
+            extWs.send(JSON.stringify({ type: "ACTIVITY", message: "Could not remove this phone. Check the server database settings." }));
+            return;
+          }
+          connectedDevices.delete(targetId);
+          deviceOwnerIds.delete(targetId);
+          deviceRegistry.delete(targetId);
+          wakeSentAt.delete(targetId);
+          if (targetSocket?.readyState === WebSocket.OPEN) targetSocket.terminate();
+          extWs.send(JSON.stringify({ type: "DEVICE_FORGOTTEN", deviceId: targetId, message: `Forgot ${targetId.slice(0, 8)}. Pair it again if you reinstall or want to reconnect.` }));
+          pushDeviceListUpdate();
+          return;
+        }
+
+        if (command === "WAKE_DEVICE" || command === "TEST_WAKE") {
+          const isTest = command === "TEST_WAKE";
+          if (!isTest && targetSocket?.readyState === WebSocket.OPEN) {
             extWs.send(JSON.stringify({ type: "WAKE_STATUS", deviceId: targetId, status: "online" }));
+            return;
+          }
+          const requestId = isTest && typeof parsed.requestId === "string" && /^[0-9a-f-]{36}$/i.test(parsed.requestId) ? parsed.requestId : "";
+          if (isTest && !requestId) {
+            extWs.send(JSON.stringify({ type: "WAKE_STATUS", deviceId: targetId, status: "failed", test: true, message: "Could not create a valid test request. Refresh and try again." }));
             return;
           }
           const pushToken = await getDevicePushToken(targetId);
@@ -1225,16 +1350,18 @@ wss.on("connection", (socket: WebSocket) => {
               type: "WAKE_STATUS",
               deviceId: targetId,
               status: "unavailable",
+              test: isTest,
               message: "No wake token is registered yet. Open PhoneBridge on the phone with internet once, then try again.",
             }));
             return;
           }
-          const result = await sendWakePush(targetId, pushToken);
+          const result = await sendWakePush(targetId, pushToken, requestId);
           extWs.send(JSON.stringify({
             type: "WAKE_STATUS",
             deviceId: targetId,
             status: result.ok ? "sent" : "failed",
-            message: result.ok ? "Wake request sent. Waiting for the phone to reconnect…" : result.reason,
+            test: isTest,
+            message: result.ok ? (isTest ? "Firebase accepted the test push. Waiting for the phone to confirm receipt…" : "Wake request sent. Waiting for the phone to reconnect…") : result.reason,
           }));
           if (result.ok) {
             broadcastToDashboards({ type: "ACTIVITY", deviceId: targetId, message: `Wake request sent to ${targetId.slice(0, 8)}; waiting for the phone.` });
