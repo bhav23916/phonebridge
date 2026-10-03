@@ -37,6 +37,8 @@ interface DeviceInfo {
   telemetry?: DeviceTelemetry;
   lastCapturedPhoto?: string;
   screenCaptureActive?: boolean;
+  remoteAudioReady?: boolean;
+  remoteAudioActive?: boolean;
   online?: boolean;
   lastSeenAt?: string | null;
   lastNetworkType?: string | null;
@@ -56,6 +58,7 @@ interface ExtWebSocket extends WebSocket {
   deviceTokenHash?: string;
   pairingCode?: string;
   pendingFcmToken?: string;
+  remoteAudioReady?: boolean;
 }
 
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
@@ -233,6 +236,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
     const notificationsByDevice = new Map();
+    const liveAudioStateByDevice = new Map();
+    const liveAudioContexts = new Map();
+    const liveAudioNextTime = new Map();
     const wakeStateByDevice = new Map();
     const wakeTimers = new Map();
     let lastDeviceSnapshot = [];
@@ -474,6 +480,19 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       } else if (msg.type === "DEVICE_FORGOTTEN") {
         logEvent(msg.message || "Phone removed from your dashboard.");
         pushDeviceListUpdate();
+      } else if (msg.type === "LIVE_AUDIO_STATUS") {
+        liveAudioStateByDevice.set(msg.deviceId, msg.error ? "error: " + msg.error : msg.active ? "Streaming · microphone active" : msg.ready ? "Ready · microphone off" : "Not armed on phone");
+        if (msg.active) logEvent("Live audio started from " + msg.deviceId.slice(0, 8) + ". Android microphone indicator is active.");
+        else if (msg.error) logEvent("Live audio unavailable: " + msg.error);
+        else logEvent("Live audio stopped on " + msg.deviceId.slice(0, 8) + ".");
+        if (!msg.active) {
+          const context = liveAudioContexts.get(msg.deviceId);
+          if (context) { context.close().catch(() => {}); liveAudioContexts.delete(msg.deviceId); }
+          liveAudioNextTime.delete(msg.deviceId);
+        }
+        renderDevices(lastDeviceSnapshot);
+      } else if (msg.type === "LIVE_AUDIO_CHUNK") {
+        playLiveAudioChunk(msg);
       } else if (msg.type === "ACTIVITY") {
         // Screenshot status, completion, and error events are also
         // delivered with dedicated message types below. Avoid logging
@@ -578,6 +597,55 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       sendCommand(deviceId, "FORGET_DEVICE");
     }
 
+    async function startLiveAudio(deviceId) {
+      try {
+        const AudioContextType = window.AudioContext;
+        if (!AudioContextType) throw new Error("This browser does not support live audio playback.");
+        let context = liveAudioContexts.get(deviceId);
+        if (!context || context.state === "closed") {
+          context = new AudioContextType({ sampleRate: 16000 });
+          liveAudioContexts.set(deviceId, context);
+        }
+        await context.resume();
+        liveAudioNextTime.set(deviceId, context.currentTime + 0.04);
+        liveAudioStateByDevice.set(deviceId, "Starting · waiting for phone");
+        renderDevices(lastDeviceSnapshot);
+        sendCommand(deviceId, "START_LIVE_AUDIO");
+      } catch (error) {
+        liveAudioStateByDevice.set(deviceId, "error: " + (error.message || "Playback could not start."));
+        renderDevices(lastDeviceSnapshot);
+      }
+    }
+
+    function stopLiveAudio(deviceId) {
+      sendCommand(deviceId, "STOP_LIVE_AUDIO");
+      const context = liveAudioContexts.get(deviceId);
+      if (context) { context.close().catch(() => {}); liveAudioContexts.delete(deviceId); }
+      liveAudioNextTime.delete(deviceId);
+    }
+
+    function playLiveAudioChunk(message) {
+      const context = liveAudioContexts.get(message.deviceId);
+      if (!context || context.state !== "running" || typeof message.audio !== "string") return;
+      try {
+        const raw = atob(message.audio);
+        const samples = Math.floor(raw.length / 2);
+        const buffer = context.createBuffer(1, samples, Number(message.sampleRate) || 16000);
+        const channel = buffer.getChannelData(0);
+        const bytes = Uint8Array.from(raw, character => character.charCodeAt(0));
+        const view = new DataView(bytes.buffer);
+        for (let index = 0; index < samples; index++) channel[index] = view.getInt16(index * 2, true) / 32768;
+        const source = context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(context.destination);
+        const nextTime = Math.max(context.currentTime + 0.025, liveAudioNextTime.get(message.deviceId) || context.currentTime);
+        source.start(nextTime);
+        liveAudioNextTime.set(message.deviceId, nextTime + buffer.duration);
+      } catch (error) {
+        logEvent("Could not play live audio: " + (error.message || "audio format error"));
+      }
+    }
+
     function renderDevices(devices) {
       lastDeviceSnapshot = Array.isArray(devices) ? devices : [];
       if (devices.length === 0) {
@@ -588,6 +656,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       deviceListEl.innerHTML = devices.map(d => {
         if (Array.isArray(d.notifications)) {
           notificationsByDevice.set(d.id, d.notifications);
+        }
+        if (!liveAudioStateByDevice.has(d.id) && typeof d.remoteAudioReady === "boolean") {
+          liveAudioStateByDevice.set(d.id, d.remoteAudioActive ? "Streaming · microphone active" : d.remoteAudioReady ? "Ready · microphone off" : "Not armed on phone");
         }
         const batteryStr = d.batteryLevel !== undefined 
           ? d.batteryLevel + "%" + (d.isCharging ? " (Charging)" : "") 
@@ -603,6 +674,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         const connectionClass = isOnline ? "" : wakeState && wakeState.startsWith("test") ? "waking" : wakeState === "waking" || wakeState === "sending" ? "waking" : "offline";
         const lastSeenText = d.lastSeenAt ? "Last seen " + new Date(d.lastSeenAt).toLocaleString() : "Not connected yet";
         const networkLabel = d.lastNetworkType ? "Last reported network: " + d.lastNetworkType : "";
+        const liveAudioState = liveAudioStateByDevice.get(d.id) || "Not armed on phone";
         const latitude = Number(d.location && d.location.latitude);
         const longitude = Number(d.location && d.location.longitude);
         const accuracy = Number(d.location && d.location.accuracy);
@@ -650,11 +722,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               <div class="screen-status" style="color: \${d.screenCaptureActive ? '#4ade80' : '#94a3b8'}">
                 Screen Capture: \${d.screenCaptureActive ? 'ACTIVE' : 'INACTIVE'}
               </div>
+              <div class="screen-status">Live Audio: \${escapeHtml(liveAudioState)}</div>
+              <div class="last-seen">Audio plays live while active and is not saved by PhoneBridge.</div>
             </div>
             <div class="actions">
               \${isOnline ? "" : "<button class=\\\"tele\\\" onclick=\\\"wakeDevice('" + d.id + "')\\\">Wake phone</button>"}
               <button class="tele" onclick="testWake('\${d.id}')">Test wake</button>
               <button class="torch-off" onclick="forgetDevice('\${d.id}')">Forget device</button>
+              <button class="tele" onclick="startLiveAudio('\${d.id}')">Start live audio</button>
+              <button class="torch-off" onclick="stopLiveAudio('\${d.id}')">Stop live audio</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_BACK')">📸 Back Cam</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_FRONT')">🤳 Front Cam</button>
               <button class="tele" onclick="sendCommand('\${d.id}', 'GET_TELEMETRY')">Sync Telemetry</button>
@@ -1031,6 +1107,9 @@ function registerPairedDevice(socket: ExtWebSocket, deviceId: string, workspaceI
       sdkInt: 0,
     });
   }
+  const deviceInfo = deviceRegistry.get(deviceId)!;
+  deviceInfo.remoteAudioReady = socket.remoteAudioReady === true;
+  deviceInfo.remoteAudioActive = false;
   socket.send(JSON.stringify({ type: "REGISTRATION_SUCCESS", deviceId }));
   socket.send(JSON.stringify({ type: "COMMAND", command: "GET_DEVICE_INFO" }));
   socket.send(JSON.stringify({ type: "COMMAND", command: "GET_BATTERY" }));
@@ -1047,6 +1126,7 @@ async function registerPhone(socket: ExtWebSocket, message: Record<string, unkno
   const deviceId = typeof message.deviceId === "string" ? message.deviceId : "";
   const deviceToken = typeof message.deviceToken === "string" ? message.deviceToken : "";
   const fcmToken = typeof message.fcmToken === "string" ? message.fcmToken : "";
+  socket.remoteAudioReady = message.remoteAudioReady === true;
   const wakeRequestId = typeof message.wakeRequestId === "string" && /^[0-9a-f-]{36}$/i.test(message.wakeRequestId) ? message.wakeRequestId : "";
   if (fcmToken.length > 0 && fcmToken.length <= 500) socket.pendingFcmToken = fcmToken;
   if (!/^[0-9a-fA-F-]{36}$/.test(deviceId) || deviceToken.length < 32 || deviceToken.length > 256) {
@@ -1272,6 +1352,31 @@ wss.on("connection", (socket: WebSocket) => {
       }
 
       if (extWs.clientType === "PENDING_PHONE") return;
+
+      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "LIVE_AUDIO_STATUS") {
+        const info = deviceRegistry.get(extWs.deviceId);
+        if (info) {
+          info.remoteAudioReady = Boolean(parsed.ready);
+          info.remoteAudioActive = Boolean(parsed.active);
+        }
+        broadcastToDashboards({
+          type: "LIVE_AUDIO_STATUS",
+          deviceId: extWs.deviceId,
+          ready: Boolean(parsed.ready),
+          active: Boolean(parsed.active),
+          ...(typeof parsed.error === "string" ? { error: parsed.error.slice(0, 240) } : {}),
+        });
+        pushDeviceListUpdate();
+        return;
+      }
+
+      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "LIVE_AUDIO_CHUNK") {
+        const audio = typeof parsed.audio === "string" ? parsed.audio : "";
+        if (audio.length > 0 && audio.length <= 12_000 && /^[A-Za-z0-9+/]+={0,2}$/.test(audio)) {
+          broadcastToDashboards({ type: "LIVE_AUDIO_CHUNK", deviceId: extWs.deviceId, sampleRate: 16_000, audio });
+        }
+        return;
+      }
 
       if (extWs.clientType === "PHONE" && parsed.type === "WAKE_RECEIVED" && extWs.deviceId) {
         const requestId = typeof parsed.requestId === "string" && /^[0-9a-f-]{36}$/i.test(parsed.requestId) ? parsed.requestId : "";
@@ -1706,11 +1811,26 @@ wss.on("connection", (socket: WebSocket) => {
     if (extWs.pairingCode) pendingPairings.delete(extWs.pairingCode);
     if (extWs.clientType === "DASHBOARD") {
       dashboardSockets.delete(extWs);
+      for (const [deviceId, phoneSocket] of connectedDevices) {
+        const info = deviceRegistry.get(deviceId);
+        const hasDashboard = [...dashboardSockets].some(dashboard =>
+          dashboard.readyState === WebSocket.OPEN && dashboard.workspaceIds?.includes(deviceOwnerIds.get(deviceId) || "")
+        );
+        if (info?.remoteAudioActive && !hasDashboard && phoneSocket.readyState === WebSocket.OPEN) {
+          phoneSocket.send(JSON.stringify({ type: "COMMAND", command: "STOP_LIVE_AUDIO" }));
+        }
+      }
       console.log("[Deck] Browser dashboard disconnected.");
     } else if (extWs.deviceId) {
       const devId = extWs.deviceId;
       if (connectedDevices.get(devId) === extWs) {
         connectedDevices.delete(devId);
+        const deviceInfo = deviceRegistry.get(devId);
+        if (deviceInfo) {
+          deviceInfo.remoteAudioReady = false;
+          deviceInfo.remoteAudioActive = false;
+        }
+        broadcastToDashboards({ type: "LIVE_AUDIO_STATUS", deviceId: devId, ready: false, active: false, error: "Phone disconnected; the audio stream ended." });
         console.log(`Device disconnected: ${devId}`);
         pushDeviceListUpdate();
         broadcastToDashboards({
