@@ -64,6 +64,7 @@ interface ExtWebSocket extends WebSocket {
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/$/, "");
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || "";
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || "";
+const SUPABASE_RECORDINGS_BUCKET = process.env.SUPABASE_RECORDINGS_BUCKET || "phonebridge-recordings";
 const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || "";
 let firebaseAccessToken: { value: string; expiresAt: number } | null = null;
 const wakeSentAt = new Map<string, number>();
@@ -236,9 +237,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const deckStatusEl = document.getElementById("deckStatus");
     const activityLogEl = document.getElementById("activityLog");
     const notificationsByDevice = new Map();
-    const liveAudioStateByDevice = new Map();
-    const liveAudioContexts = new Map();
-    const liveAudioNextTime = new Map();
+    const remoteRecordingStateByDevice = new Map();
+    const recordingsByDevice = new Map();
     const wakeStateByDevice = new Map();
     const wakeTimers = new Map();
     let lastDeviceSnapshot = [];
@@ -481,18 +481,27 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         logEvent(msg.message || "Phone removed from your dashboard.");
         pushDeviceListUpdate();
       } else if (msg.type === "LIVE_AUDIO_STATUS") {
-        liveAudioStateByDevice.set(msg.deviceId, msg.error ? "error: " + msg.error : msg.active ? "Streaming · microphone active" : msg.ready ? "Ready · microphone off" : "Not armed on phone");
-        if (msg.active) logEvent("Live audio started from " + msg.deviceId.slice(0, 8) + ". Android microphone indicator is active.");
-        else if (msg.error) logEvent("Live audio unavailable: " + msg.error);
-        else logEvent("Live audio stopped on " + msg.deviceId.slice(0, 8) + ".");
-        if (!msg.active) {
-          const context = liveAudioContexts.get(msg.deviceId);
-          if (context) { context.close().catch(() => {}); liveAudioContexts.delete(msg.deviceId); }
-          liveAudioNextTime.delete(msg.deviceId);
-        }
+        remoteRecordingStateByDevice.set(msg.deviceId, msg.error ? "error: " + msg.error : msg.active ? "Recording · microphone active" : msg.ready ? "Standby · start from dashboard" : "Standby is off on phone");
+        if (msg.active) logEvent("Voice recording started on " + msg.deviceId.slice(0, 8) + ". Android microphone indicator is active.");
+        else if (msg.error) logEvent("Recording unavailable: " + msg.error);
+        else if (msg.ready) logEvent("Voice recording stopped on " + msg.deviceId.slice(0, 8) + ". Upload will continue when the phone is online.");
         renderDevices(lastDeviceSnapshot);
-      } else if (msg.type === "LIVE_AUDIO_CHUNK") {
-        playLiveAudioChunk(msg);
+      } else if (msg.type === "RECORDINGS_LIST") {
+        recordingsByDevice.set(msg.deviceId, Array.isArray(msg.recordings) ? msg.recordings : []);
+        showRecordingsModal(msg.deviceId, recordingsByDevice.get(msg.deviceId));
+      } else if (msg.type === "RECORDING_STORED") {
+        const recordings = recordingsByDevice.get(msg.deviceId) || [];
+        recordings.unshift(msg);
+        recordingsByDevice.set(msg.deviceId, recordings.slice(0, 100));
+        remoteRecordingStateByDevice.set(msg.deviceId, "Uploaded · ready to play");
+        logEvent("Voice recording uploaded from " + msg.deviceId.slice(0, 8) + ".");
+        showRecordingsModal(msg.deviceId, recordingsByDevice.get(msg.deviceId));
+        renderDevices(lastDeviceSnapshot);
+      } else if (msg.type === "RECORDING_DELETED") {
+        const recordings = (recordingsByDevice.get(msg.deviceId) || []).filter(recording => recording.recordingId !== msg.recordingId);
+        recordingsByDevice.set(msg.deviceId, recordings);
+        showRecordingsModal(msg.deviceId, recordings);
+        logEvent("Voice recording deleted from Supabase storage.");
       } else if (msg.type === "ACTIVITY") {
         // Screenshot status, completion, and error events are also
         // delivered with dedicated message types below. Avoid logging
@@ -597,53 +606,56 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       sendCommand(deviceId, "FORGET_DEVICE");
     }
 
-    async function startLiveAudio(deviceId) {
-      try {
-        const AudioContextType = window.AudioContext;
-        if (!AudioContextType) throw new Error("This browser does not support live audio playback.");
-        let context = liveAudioContexts.get(deviceId);
-        if (!context || context.state === "closed") {
-          context = new AudioContextType({ sampleRate: 16000 });
-          liveAudioContexts.set(deviceId, context);
-        }
-        await context.resume();
-        liveAudioNextTime.set(deviceId, context.currentTime + 0.04);
-        liveAudioStateByDevice.set(deviceId, "Starting · waiting for phone");
-        renderDevices(lastDeviceSnapshot);
-        sendCommand(deviceId, "START_LIVE_AUDIO");
-      } catch (error) {
-        liveAudioStateByDevice.set(deviceId, "error: " + (error.message || "Playback could not start."));
-        renderDevices(lastDeviceSnapshot);
-      }
+    function startRemoteRecording(deviceId) {
+      remoteRecordingStateByDevice.set(deviceId, "Starting · waiting for phone");
+      renderDevices(lastDeviceSnapshot);
+      sendCommand(deviceId, "START_LIVE_AUDIO");
     }
 
-    function stopLiveAudio(deviceId) {
+    function stopRemoteRecording(deviceId) {
       sendCommand(deviceId, "STOP_LIVE_AUDIO");
-      const context = liveAudioContexts.get(deviceId);
-      if (context) { context.close().catch(() => {}); liveAudioContexts.delete(deviceId); }
-      liveAudioNextTime.delete(deviceId);
     }
 
-    function playLiveAudioChunk(message) {
-      const context = liveAudioContexts.get(message.deviceId);
-      if (!context || context.state !== "running" || typeof message.audio !== "string") return;
-      try {
-        const raw = atob(message.audio);
-        const samples = Math.floor(raw.length / 2);
-        const buffer = context.createBuffer(1, samples, Number(message.sampleRate) || 16000);
-        const channel = buffer.getChannelData(0);
-        const bytes = Uint8Array.from(raw, character => character.charCodeAt(0));
-        const view = new DataView(bytes.buffer);
-        for (let index = 0; index < samples; index++) channel[index] = view.getInt16(index * 2, true) / 32768;
-        const source = context.createBufferSource();
-        source.buffer = buffer;
-        source.connect(context.destination);
-        const nextTime = Math.max(context.currentTime + 0.025, liveAudioNextTime.get(message.deviceId) || context.currentTime);
-        source.start(nextTime);
-        liveAudioNextTime.set(message.deviceId, nextTime + buffer.duration);
-      } catch (error) {
-        logEvent("Could not play live audio: " + (error.message || "audio format error"));
+    function requestRecordings(deviceId) {
+      sendCommand(deviceId, "LIST_RECORDINGS");
+    }
+
+    function showRecordingsModal(deviceId, recordings) {
+      document.getElementById("recordsTitle").textContent = "Voice recordings — " + deviceId.slice(0, 8);
+      const body = document.getElementById("recordsBody");
+      body.innerHTML = "";
+      if (!Array.isArray(recordings) || recordings.length === 0) {
+        const empty = document.createElement("p");
+        empty.textContent = "No recordings are saved yet.";
+        body.appendChild(empty);
+      } else {
+        recordings.forEach(recording => {
+          if (!recording || typeof recording.url !== "string") return;
+          const item = document.createElement("div");
+          item.style.cssText = "padding:12px 0;border-bottom:1px solid #334155";
+          const label = document.createElement("div");
+          label.textContent = recording.createdAt ? new Date(recording.createdAt).toLocaleString() : "Saved recording";
+          label.style.marginBottom = "8px";
+          const player = document.createElement("audio");
+          player.controls = true;
+          player.preload = "none";
+          player.src = recording.url;
+          player.style.width = "100%";
+          const remove = document.createElement("button");
+          remove.textContent = "Delete recording";
+          remove.className = "torch-off";
+          remove.style.marginTop = "8px";
+          remove.addEventListener("click", () => deleteRecording(deviceId, recording.recordingId));
+          item.append(label, player, remove);
+          body.appendChild(item);
+        });
       }
+      document.getElementById("recordsModal").classList.add("active");
+    }
+
+    function deleteRecording(deviceId, recordingId) {
+      if (!window.confirm("Permanently delete this voice recording?")) return;
+      sendCommand(deviceId, "DELETE_RECORDING", { recordingId });
     }
 
     function renderDevices(devices) {
@@ -657,8 +669,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         if (Array.isArray(d.notifications)) {
           notificationsByDevice.set(d.id, d.notifications);
         }
-        if (!liveAudioStateByDevice.has(d.id) && typeof d.remoteAudioReady === "boolean") {
-          liveAudioStateByDevice.set(d.id, d.remoteAudioActive ? "Streaming · microphone active" : d.remoteAudioReady ? "Ready · microphone off" : "Not armed on phone");
+        if (!remoteRecordingStateByDevice.has(d.id) && typeof d.remoteAudioReady === "boolean") {
+          remoteRecordingStateByDevice.set(d.id, d.remoteAudioActive ? "Recording · microphone active" : d.remoteAudioReady ? "Standby · start from dashboard" : "Standby is off on phone");
         }
         const batteryStr = d.batteryLevel !== undefined 
           ? d.batteryLevel + "%" + (d.isCharging ? " (Charging)" : "") 
@@ -674,7 +686,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
         const connectionClass = isOnline ? "" : wakeState && wakeState.startsWith("test") ? "waking" : wakeState === "waking" || wakeState === "sending" ? "waking" : "offline";
         const lastSeenText = d.lastSeenAt ? "Last seen " + new Date(d.lastSeenAt).toLocaleString() : "Not connected yet";
         const networkLabel = d.lastNetworkType ? "Last reported network: " + d.lastNetworkType : "";
-        const liveAudioState = liveAudioStateByDevice.get(d.id) || "Not armed on phone";
+        const liveAudioState = remoteRecordingStateByDevice.get(d.id) || "Standby is off on phone";
         const latitude = Number(d.location && d.location.latitude);
         const longitude = Number(d.location && d.location.longitude);
         const accuracy = Number(d.location && d.location.accuracy);
@@ -722,15 +734,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
               <div class="screen-status" style="color: \${d.screenCaptureActive ? '#4ade80' : '#94a3b8'}">
                 Screen Capture: \${d.screenCaptureActive ? 'ACTIVE' : 'INACTIVE'}
               </div>
-              <div class="screen-status">Live Audio: \${escapeHtml(liveAudioState)}</div>
-              <div class="last-seen">Audio plays live while active and is not saved by PhoneBridge.</div>
+              <div class="screen-status">Voice recording: \${escapeHtml(liveAudioState)}</div>
+              <div class="last-seen">Recordings are saved on the phone first and uploaded privately to your Supabase project.</div>
             </div>
             <div class="actions">
               \${isOnline ? "" : "<button class=\\\"tele\\\" onclick=\\\"wakeDevice('" + d.id + "')\\\">Wake phone</button>"}
               <button class="tele" onclick="testWake('\${d.id}')">Test wake</button>
               <button class="torch-off" onclick="forgetDevice('\${d.id}')">Forget device</button>
-              <button class="tele" onclick="startLiveAudio('\${d.id}')">Start live audio</button>
-              <button class="torch-off" onclick="stopLiveAudio('\${d.id}')">Stop live audio</button>
+              <button class="tele" onclick="startRemoteRecording('\${d.id}')">Start recording</button>
+              <button class="torch-off" onclick="stopRemoteRecording('\${d.id}')">Stop recording</button>
+              <button onclick="requestRecordings('\${d.id}')">Recordings</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_BACK')">📸 Back Cam</button>
               <button class="cam" onclick="sendCommand('\${d.id}', 'CAPTURE_PHOTO_FRONT')">🤳 Front Cam</button>
               <button class="tele" onclick="sendCommand('\${d.id}', 'GET_TELEMETRY')">Sync Telemetry</button>
@@ -783,6 +796,8 @@ const deviceOwnerIds = new Map<string, string>();
 const dashboardSockets = new Set<ExtWebSocket>();
 const pendingPairings = new Map<string, { socket: ExtWebSocket; expiresAt: number }>();
 const pairingAttemptsByUser = new Map<string, { count: number; windowStartedAt: number }>();
+type PendingRecordingUpload = { recordingId: string; expectedSize: number; receivedSize: number; nextChunk: number; chunks: Buffer[]; startedAt: number };
+const pendingRecordingUploads = new Map<string, PendingRecordingUpload>();
 
 function sha256(value: string): string {
   return createHash("sha256").update(value).digest("hex");
@@ -1205,6 +1220,79 @@ function broadcastToDashboards(messageObj: object) {
   });
 }
 
+function supabaseStorageHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  return { apikey: SUPABASE_SECRET_KEY, Authorization: `Bearer ${SUPABASE_SECRET_KEY}`, ...extra };
+}
+
+async function ensureRecordingsBucket(): Promise<void> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) throw new Error("Supabase server storage credentials are not configured.");
+  const base = `${SUPABASE_URL}/storage/v1`;
+  const existing = await fetch(`${base}/bucket/${encodeURIComponent(SUPABASE_RECORDINGS_BUCKET)}`, { headers: supabaseStorageHeaders() });
+  if (existing.ok) return;
+  const created = await fetch(`${base}/bucket`, {
+    method: "POST",
+    headers: supabaseStorageHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      id: SUPABASE_RECORDINGS_BUCKET,
+      name: SUPABASE_RECORDINGS_BUCKET,
+      public: false,
+      file_size_limit: 67_108_864,
+      allowed_mime_types: ["audio/mp4"],
+    }),
+  });
+  if (!created.ok && created.status !== 409) {
+    throw new Error(`Could not create the private recordings bucket (${created.status}): ${(await created.text()).slice(0, 300)}`);
+  }
+}
+
+async function createRecordingSignedUrl(deviceId: string, filename: string): Promise<string> {
+  const objectPath = `${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`;
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${encodeURIComponent(SUPABASE_RECORDINGS_BUCKET)}/${objectPath}`, {
+    method: "POST",
+    headers: supabaseStorageHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ expiresIn: 86_400 }),
+  });
+  if (!response.ok) throw new Error(`Could not create recording playback link (${response.status}).`);
+  const result = await response.json() as { signedURL?: string; signedUrl?: string };
+  const signed = result.signedURL || result.signedUrl;
+  if (!signed) throw new Error("Supabase returned no recording playback link.");
+  if (/^https?:\/\//i.test(signed)) return signed;
+  if (signed.startsWith("/storage/v1/")) return `${SUPABASE_URL}${signed}`;
+  return `${SUPABASE_URL}/storage/v1${signed.startsWith("/") ? signed : `/${signed}`}`;
+}
+
+async function storeRecording(deviceId: string, recordingId: string, bytes: Buffer): Promise<{ url: string; createdAt: string }> {
+  await ensureRecordingsBucket();
+  const filename = `${recordingId}.m4a`;
+  const objectPath = `${encodeURIComponent(deviceId)}/${encodeURIComponent(filename)}`;
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_RECORDINGS_BUCKET)}/${objectPath}`, {
+    method: "POST",
+    headers: supabaseStorageHeaders({ "Content-Type": "audio/mp4", "x-upsert": "true" }),
+    body: bytes as unknown as BodyInit,
+  });
+  if (!response.ok) throw new Error(`Supabase could not store the recording (${response.status}): ${(await response.text()).slice(0, 300)}`);
+  return { url: await createRecordingSignedUrl(deviceId, filename), createdAt: new Date().toISOString() };
+}
+
+async function listDeviceRecordings(deviceId: string): Promise<Array<{ recordingId: string; url: string; createdAt?: string; size?: number }>> {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return [];
+  const response = await fetch(`${SUPABASE_URL}/storage/v1/object/list/${encodeURIComponent(SUPABASE_RECORDINGS_BUCKET)}`, {
+    method: "POST",
+    headers: supabaseStorageHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ prefix: `${deviceId}/`, limit: 100, offset: 0, sortBy: { column: "created_at", order: "desc" } }),
+  });
+  if (response.status === 404) return [];
+  if (!response.ok) throw new Error(`Could not list recordings (${response.status}).`);
+  const rows = await response.json() as Array<{ name?: string; created_at?: string; metadata?: { size?: number } }>;
+  const recordings = rows.filter(row => typeof row.name === "string" && /^[0-9a-f-]{36}\.m4a$/i.test(row.name));
+  return Promise.all(recordings.map(async row => ({
+    recordingId: (row.name as string).slice(0, -4),
+    url: await createRecordingSignedUrl(deviceId, row.name as string),
+    createdAt: row.created_at,
+    size: row.metadata?.size,
+  })));
+}
+
 function pushDeviceListUpdate() {
   dashboardSockets.forEach(async (dash) => {
     if (!dash.userId || dash.readyState !== WebSocket.OPEN || (dash.authExpiresAt || 0) <= Date.now()) return;
@@ -1370,10 +1458,58 @@ wss.on("connection", (socket: WebSocket) => {
         return;
       }
 
-      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "LIVE_AUDIO_CHUNK") {
-        const audio = typeof parsed.audio === "string" ? parsed.audio : "";
-        if (audio.length > 0 && audio.length <= 12_000 && /^[A-Za-z0-9+/]+={0,2}$/.test(audio)) {
-          broadcastToDashboards({ type: "LIVE_AUDIO_CHUNK", deviceId: extWs.deviceId, sampleRate: 16_000, audio });
+      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "RECORDING_UPLOAD_START") {
+        const recordingId = typeof parsed.recordingId === "string" ? parsed.recordingId : "";
+        const size = Number(parsed.size);
+        const workspaceId = deviceOwnerIds.get(extWs.deviceId);
+        if (!workspaceId || !recordingId.match(/^[0-9a-f-]{36}$/i) || !Number.isSafeInteger(size) || size < 1_024 || size > 64 * 1024 * 1024) {
+          extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_DONE", recordingId, ok: false, error: "Recording upload metadata is invalid or exceeds the 64 MB limit." }));
+          return;
+        }
+        const old = pendingRecordingUploads.get(extWs.deviceId);
+        if (old && Date.now() - old.startedAt < 15 * 60_000 && old.recordingId !== recordingId) {
+          extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_DONE", recordingId, ok: false, error: "Another recording upload is already in progress." }));
+          return;
+        }
+        const pendingBytes = [...pendingRecordingUploads.values()].reduce((total, item) => total + item.expectedSize, 0) - (old?.expectedSize || 0);
+        if (pendingBytes + size > 128 * 1024 * 1024) {
+          extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_DONE", recordingId, ok: false, error: "The server is temporarily busy receiving recordings. Try again in a few minutes." }));
+          return;
+        }
+        pendingRecordingUploads.set(extWs.deviceId, { recordingId, expectedSize: size, receivedSize: 0, nextChunk: 0, chunks: [], startedAt: Date.now() });
+        extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_ACK", recordingId, nextChunk: 0 }));
+        return;
+      }
+
+      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "RECORDING_UPLOAD_CHUNK") {
+        const upload = pendingRecordingUploads.get(extWs.deviceId);
+        const data = typeof parsed.data === "string" ? parsed.data : "";
+        const chunkIndex = Number(parsed.index);
+        if (!upload || upload.recordingId !== parsed.recordingId || chunkIndex !== upload.nextChunk || data.length > 40_000 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) return;
+        const chunk = Buffer.from(data, "base64");
+        if (!chunk.length || chunk.length > 24 * 1024 || upload.receivedSize + chunk.length > upload.expectedSize) return;
+        upload.chunks.push(chunk);
+        upload.receivedSize += chunk.length;
+        upload.nextChunk += 1;
+        extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_ACK", recordingId: upload.recordingId, nextChunk: upload.nextChunk }));
+        return;
+      }
+
+      if (extWs.clientType === "PHONE" && extWs.deviceId && parsed.type === "RECORDING_UPLOAD_FINISH") {
+        const upload = pendingRecordingUploads.get(extWs.deviceId);
+        const recordingId = typeof parsed.recordingId === "string" ? parsed.recordingId : "";
+        if (!upload || upload.recordingId !== recordingId) return;
+        pendingRecordingUploads.delete(extWs.deviceId);
+        try {
+          if (upload.receivedSize !== upload.expectedSize) throw new Error("The uploaded recording was incomplete; the phone will retry it later.");
+          const bytes = Buffer.concat(upload.chunks, upload.receivedSize);
+          const stored = await storeRecording(extWs.deviceId, upload.recordingId, bytes);
+          extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_DONE", recordingId, ok: true }));
+          broadcastToDashboards({ type: "RECORDING_STORED", deviceId: extWs.deviceId, recordingId, url: stored.url, createdAt: stored.createdAt, size: bytes.length });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "Could not save recording.";
+          extWs.send(JSON.stringify({ type: "RECORDING_UPLOAD_DONE", recordingId, ok: false, error: message.slice(0, 240) }));
+          broadcastToDashboards({ type: "ACTIVITY", deviceId: extWs.deviceId, message: `Recording upload failed: ${message.slice(0, 180)}` });
         }
         return;
       }
@@ -1471,6 +1607,35 @@ wss.on("connection", (socket: WebSocket) => {
           }));
           if (result.ok) {
             broadcastToDashboards({ type: "ACTIVITY", deviceId: targetId, message: `Wake request sent to ${targetId.slice(0, 8)}; waiting for the phone.` });
+          }
+          return;
+        }
+
+        if (command === "LIST_RECORDINGS") {
+          try {
+            const recordings = await listDeviceRecordings(targetId);
+            extWs.send(JSON.stringify({ type: "RECORDINGS_LIST", deviceId: targetId, recordings }));
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Could not load recordings.";
+            extWs.send(JSON.stringify({ type: "ACTIVITY", deviceId: targetId, message }));
+          }
+          return;
+        }
+
+        if (command === "DELETE_RECORDING") {
+          const recordingId = typeof parsed.recordingId === "string" ? parsed.recordingId : "";
+          if (!/^[0-9a-f-]{36}$/i.test(recordingId)) return;
+          try {
+            const response = await fetch(`${SUPABASE_URL}/storage/v1/object/${encodeURIComponent(SUPABASE_RECORDINGS_BUCKET)}`, {
+              method: "DELETE",
+              headers: supabaseStorageHeaders({ "Content-Type": "application/json" }),
+              body: JSON.stringify({ prefixes: [`${targetId}/${recordingId}.m4a`] }),
+            });
+            if (!response.ok) throw new Error(`Storage delete returned ${response.status}.`);
+            extWs.send(JSON.stringify({ type: "RECORDING_DELETED", deviceId: targetId, recordingId }));
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "Could not delete recording.";
+            extWs.send(JSON.stringify({ type: "ACTIVITY", deviceId: targetId, message }));
           }
           return;
         }
@@ -1811,26 +1976,17 @@ wss.on("connection", (socket: WebSocket) => {
     if (extWs.pairingCode) pendingPairings.delete(extWs.pairingCode);
     if (extWs.clientType === "DASHBOARD") {
       dashboardSockets.delete(extWs);
-      for (const [deviceId, phoneSocket] of connectedDevices) {
-        const info = deviceRegistry.get(deviceId);
-        const hasDashboard = [...dashboardSockets].some(dashboard =>
-          dashboard.readyState === WebSocket.OPEN && dashboard.workspaceIds?.includes(deviceOwnerIds.get(deviceId) || "")
-        );
-        if (info?.remoteAudioActive && !hasDashboard && phoneSocket.readyState === WebSocket.OPEN) {
-          phoneSocket.send(JSON.stringify({ type: "COMMAND", command: "STOP_LIVE_AUDIO" }));
-        }
-      }
       console.log("[Deck] Browser dashboard disconnected.");
     } else if (extWs.deviceId) {
       const devId = extWs.deviceId;
+      pendingRecordingUploads.delete(devId);
       if (connectedDevices.get(devId) === extWs) {
         connectedDevices.delete(devId);
         const deviceInfo = deviceRegistry.get(devId);
         if (deviceInfo) {
           deviceInfo.remoteAudioReady = false;
-          deviceInfo.remoteAudioActive = false;
         }
-        broadcastToDashboards({ type: "LIVE_AUDIO_STATUS", deviceId: devId, ready: false, active: false, error: "Phone disconnected; the audio stream ended." });
+        broadcastToDashboards({ type: "LIVE_AUDIO_STATUS", deviceId: devId, ready: false, active: Boolean(deviceInfo?.remoteAudioActive), error: "Phone disconnected. An active recording may continue locally; use the phone notification to stop it." });
         console.log(`Device disconnected: ${devId}`);
         pushDeviceListUpdate();
         broadcastToDashboards({
